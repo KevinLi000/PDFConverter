@@ -1,0 +1,5 @@
+PyMuPDF==1.21.1
+python-docx==0.8.11
+Pillow==9.5.0
+numpy==1.24.3
+pdfminer.six==20221105
