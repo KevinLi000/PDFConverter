@@ -229,7 +229,8 @@ class EnhancedPDFConverter:
                     print("已加载基础表格检测功能")
                 except ImportError:
                     print("无法导入表格检测工具，可能影响表格识别功能")
-            
+
+       
     @property
     def dpi(self):
         """DPI属性的getter"""
@@ -650,6 +651,86 @@ class EnhancedPDFConverter:
         # 默认返回通用字体
         return "Arial"
     
+        """
+        分别处理页面元素，支持表格和图像的精确识别
+        
+        参数:
+            doc: Word文档对象
+            page: PDF页面
+            pdf_document: PDF文档
+            tables: 在页面中检测到的表格列表
+            is_complex: 是否是复杂页面
+        """
+        try:
+            # 获取页面内容
+            page_dict = page.get_text("dict", sort=True)
+            blocks = page_dict["blocks"]
+            
+            # 预处理块，标记表格区域
+            blocks = self._mark_table_regions(blocks, tables)
+            
+            # 按y0坐标排序块，以保持垂直阅读顺序
+            blocks.sort(key=lambda b: (b["bbox"][1], b["bbox"][0]))
+            
+            # 依次处理每个块
+            current_y = -1
+            current_paragraph = None
+            
+            for block in blocks:
+                # 处理表格 - 使用高级表格处理函数
+                if block.get("is_table", False):
+                    self._process_table_with_merged_cells(doc, block, page, pdf_document, tables)
+                    current_paragraph = None
+                    current_y = -1
+                    continue
+                
+                # 处理图像 - 使用高质量图像提取
+                if block["type"] == 1:
+                    self._process_image_block_enhanced(doc, pdf_document, page, block)
+                    current_paragraph = None
+                    current_y = -1
+                    continue
+                
+                # 处理文本
+                if block["type"] == 0:
+                    block_y = block["bbox"][1]
+                    new_paragraph_needed = (current_y == -1 or 
+                                        (abs(block_y - current_y) > 12) or  
+                                        self._is_new_paragraph_by_indent(block, current_paragraph))
+                    
+                    if new_paragraph_needed:
+                        current_paragraph = doc.add_paragraph()
+                        current_y = block_y
+                        
+                        # 设置段落格式
+                        try:
+                            format_result = self._detect_paragraph_format(block, page.rect.width)
+                            if isinstance(format_result, tuple) and len(format_result) == 2:
+                                alignment, left_indent = format_result
+                            else:
+                                alignment = WD_ALIGN_PARAGRAPH.LEFT
+                                left_indent = 0
+                            current_paragraph.alignment = alignment
+                            
+                            # 限制左缩进到安全范围
+                            if left_indent > 0:
+                                left_indent = min(max(left_indent, 0), 100)
+                                current_paragraph.paragraph_format.left_indent = Cm(left_indent / 28.35)
+                        except Exception as e:
+                            print(f"设置段落格式时出错: {e}")
+                            current_paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    
+                    # 处理文本块 - 保留格式
+                    self._process_text_block_with_style(current_paragraph, block)
+            
+            # 处理可能被漏掉的图形和图表
+            self._process_vector_graphics(doc, page)
+            
+        except Exception as e:
+            print(f"处理页面元素时出错: {e}")
+            traceback.print_exc()
+            # 如果处理元素失败，回退到较安全的页面处理方法
+            self._process_complex_page_by_elements(doc, page, pdf_document, tables)
     def _detect_paragraph_format(self, block, page_width):
         """
         检测文本块的段落格式（对齐方式和缩进）
@@ -968,86 +1049,219 @@ class EnhancedPDFConverter:
         except Exception as e:
             print(f"应用高级表格修复时出错: {e}")
             traceback.print_exc()    
+    
+    def _process_text_with_exact_line_breaks(self, paragraph, block):
+        """
+        处理文本块，精确保留原始换行和段落格式
+        
+        参数:
+            paragraph: Word段落对象
+            block: PDF文本块
+        """
+        try:
+            # 1. 首先检查是否存在lines
+            if "lines" not in block or not block["lines"]:
+                if "text" in block and block["text"]:
+                    # 如果只有文本，直接处理可能的换行
+                    lines = block["text"].split("\n")
+                    if len(lines) > 1:
+                        paragraph.add_run(lines[0])
+                        for line in lines[1:]:
+                            last_run = paragraph.add_run()
+                            last_run.add_break()  # 添加换行符
+                            paragraph.add_run(line)
+                    else:
+                        paragraph.add_run(block["text"])
+                return
+
+            # 2. 处理样式信息
+            page_width = block.get("page_width", 595)  # 默认A4宽度
+            align, left_indent = self._detect_paragraph_format(block, page_width)
+            paragraph.alignment = align
+            
+            # 限制左缩进到安全范围
+            if left_indent > 0:
+                left_indent = min(max(left_indent, 0), 100)
+                paragraph.paragraph_format.left_indent = Pt(left_indent * 0.35)
+
+            # 3. 获取行间距信息以检测真正的段落分隔
+            lines = block["lines"]
+            y_positions = [(i, line["bbox"][1], line["bbox"][3]) for i, line in enumerate(lines)]
+            avg_line_height = 0
+            line_gaps = []
+            
+            if len(lines) > 1:
+                for i in range(len(lines) - 1):
+                    curr_bottom = lines[i]["bbox"][3]
+                    next_top = lines[i+1]["bbox"][1]
+                    gap = next_top - curr_bottom
+                    line_gaps.append(gap)
+                
+                if line_gaps:
+                    avg_line_height = sum(line_gaps) / len(line_gaps)
+            
+            # 4. 智能处理每一行文本
+            for i, line in enumerate(lines):
+                line_spans = line.get("spans", [])
+                
+                # 添加该行文本，保留格式
+                for span in line_spans:
+                    text = span.get("text", "")
+                    if not text:
+                        continue
+                    
+                    # 创建带格式的文本运行
+                    run = paragraph.add_run(text)
+                    
+                    # 应用字体样式
+                    font_name = span.get("font", "")
+                    if font_name:
+                        run.font.name = font_name
+                    
+                    # 应用字体大小
+                    font_size = span.get("size", 0)
+                    if font_size > 0:
+                        run.font.size = Pt(font_size)
+                    
+                    # 应用字体样式 - 粗体、斜体、下划线
+                    flags = span.get("flags", 0)
+                    if flags:
+                        run.font.bold = bool(flags & 0x1)  # 粗体
+                        run.font.italic = bool(flags & 0x2)  # 斜体
+                        run.font.underline = bool(flags & 0x4)  # 下划线
+                    
+                    # 应用颜色
+                    color = span.get("color", "")
+                    if color:
+                        if isinstance(color, str) and len(color) == 6:
+                            try:
+                                r = int(color[0:2], 16)
+                                g = int(color[2:4], 16)
+                                b = int(color[4:6], 16)
+                                run.font.color.rgb = RGBColor(r, g, b)
+                            except ValueError:
+                                pass
+                        elif isinstance(color, (list, tuple)) and len(color) >= 3:
+                            r, g, b = color[0], color[1], color[2]
+                            run.font.color.rgb = RGBColor(r, g, b)
+                
+                # 判断是否需要添加换行或新段落
+                if i < len(lines) - 1:  # 不是最后一行
+                    # 如果两行之间的间距大于平均行高的1.8倍，创建新段落
+                    curr_bottom = line["bbox"][3]
+                    next_top = lines[i+1]["bbox"][1]
+                    line_gap = next_top - curr_bottom
+                    
+                    if avg_line_height > 0 and line_gap > avg_line_height * 1.8:
+                        # 创建新段落
+                        paragraph = paragraph._parent.add_paragraph()
+                        paragraph.alignment = align
+                        if left_indent > 0:
+                            paragraph.paragraph_format.left_indent = Pt(left_indent * 0.35)
+                    else:
+                        # 在同一段落内添加换行符
+                        if paragraph.runs:
+                            paragraph.runs[-1].add_break()
+        
+        except Exception as e:
+            print(f"精确换行处理时出错: {e}")
+            traceback.print_exc()
+            
+            # 回退到简单文本处理
+            try:
+                text = ""
+                if "text" in block:
+                    text = block["text"]
+                elif "lines" in block:
+                    lines_text = []
+                    for line in block["lines"]:
+                        line_text = "".join(span.get("text", "") for span in line.get("spans", []))
+                        lines_text.append(line_text)
+                    text = "\n".join(filter(None, lines_text))  # 使用换行符连接，过滤空行
+                
+                # 处理文本中的换行
+                if text:
+                    if "\n" in text:
+                        lines = text.split("\n")
+                        paragraph.add_run(lines[0])
+                        for line in lines[1:]:
+                            paragraph.add_run().add_break()
+                            paragraph.add_run(line)
+                    else:
+                        paragraph.add_run(text)
+            except:
+                paragraph.add_run("[无法处理文本]")
+    
+    
     def _process_text_block_enhanced(self, paragraph, block):
         """
-        处理文本块，增强版 - 尽量保留段落格式
+        处理文本块，增强版 - 改进段落格式和换行处理
         参数:
             paragraph: Word文档中的段落对象
             block: PDF文本块
         """
-        lines = block.get("lines", [])
-        if not lines:
-            return
+        # 使用精确换行处理方法
+        return self._process_text_with_exact_line_breaks(paragraph, block)
 
-        # 检测对齐和缩进
-        page_width = block.get("page_width", 595)  # 取默认A4宽度
-        align, left_indent = self._detect_paragraph_format(block, page_width)
-        paragraph.alignment = align
-        # Clamp left_indent to a safe range (0-100 points)
-        if left_indent > 0:
-            left_indent = min(max(left_indent, 0), 100)
-            paragraph.paragraph_format.left_indent = Pt(left_indent * 0.35)  # 点转磅
 
-        # 检测标题
-        is_heading = False
-        if "heading" in str(block.get("type", "")).lower() or any(
-            span.get("size", 0) > 14 for line in lines for span in line.get("spans", [])
-        ):
-            is_heading = True
-            paragraph.style = "Heading 1"
 
-        # 检测列表
-        first_text = lines[0]["spans"][0]["text"].strip() if lines and lines[0].get("spans") else ""
-        if first_text.startswith(("-", "•", "·")):
-            paragraph.style = "List Bullet"
-        elif first_text[:2].isdigit() and first_text[2:3] in (".", "、"):
-            paragraph.style = "List Number"
-
-        # 处理文本内容，保留换行符
-        prev_left = None
-        prev_y_bottom = None
-        for idx, line in enumerate(lines):
-            line_text = "".join(span.get("text", "") for span in line.get("spans", []))
-            current_y_top = line["bbox"][1]
-            
-            if idx == 0:
-                # 第一行直接添加
-                paragraph.add_run(line_text)
-                prev_left = line["bbox"][0]
-                prev_y_bottom = line["bbox"][3]  # 底部y坐标
-            else:
-                # 判断是否新段落（如缩进/空行/行距大等）
-                is_new_para = False
-                line_spacing = current_y_top - prev_y_bottom if prev_y_bottom else 0
+    def _add_formatted_text(self, paragraph, line):
+        """
+        将格式化文本添加到段落
+        
+        参数:
+            paragraph: Word段落对象
+            line: 文本行
+        """
+        try:
+            # 处理spans以保留格式
+            for span in line.get("spans", []):
+                text = span.get("text", "")
+                if not text:
+                    continue
+                    
+                # 添加带格式的文本
+                run = paragraph.add_run(text)
                 
-                # 检查明显的段落变化
-                if abs(line["bbox"][0] - prev_left) > 10:  # 缩进变化
-                    is_new_para = True
-                elif line_spacing > 15:  # 行间距明显大于普通行间距
-                    is_new_para = True
-                elif not line_text.strip():  # 空行
-                    is_new_para = True
+                # 设置字体名称
+                font_name = span.get("font", "")
+                if font_name:
+                    run.font.name = font_name
                 
-                if is_new_para:
-                    # 创建新段落
-                    paragraph = paragraph._parent.add_paragraph()
-                    paragraph.alignment = align
-                    if left_indent > 0:
-                        paragraph.paragraph_format.left_indent = Pt(left_indent * 0.35)
-                    paragraph.add_run(line_text)
-                else:
-                    # 同一段落内的换行
-                    # 添加换行符并继续在同一段落
-                    last_run = paragraph.runs[-1] if paragraph.runs else None
-                    if last_run:
-                        # 检查上一个run的文本是否以换行结束
-                        if not last_run.text.endswith('\n'):
-                            last_run.add_break()  # 添加换行符
-                    paragraph.add_run(line_text)
+                # 设置字体大小
+                font_size = span.get("size", 0)
+                if font_size > 0:
+                    run.font.size = Pt(font_size)
                 
-                prev_left = line["bbox"][0]
-                prev_y_bottom = line["bbox"][3]
-
+                # 设置字体样式 - 粗体、斜体、下划线
+                flags = span.get("flags", 0)
+                if flags:
+                    run.font.bold = bool(flags & 0x1)       # 粗体
+                    run.font.italic = bool(flags & 0x2)     # 斜体
+                    run.font.underline = bool(flags & 0x4)  # 下划线
+                
+                # 设置颜色
+                color = span.get("color", "")
+                if color:
+                    if isinstance(color, str) and len(color) == 6:
+                        try:
+                            r = int(color[0:2], 16)
+                            g = int(color[2:4], 16)
+                            b = int(color[4:6], 16)
+                            run.font.color.rgb = RGBColor(r, g, b)
+                        except:
+                            pass
+                    elif isinstance(color, (list, tuple)) and len(color) >= 3:
+                        r, g, b = color[0], color[1], color[2]
+                        run.font.color.rgb = RGBColor(r, g, b)
+        
+        except Exception as e:
+            print(f"添加格式化文本时出错: {e}")
+            # 回退到简单文本
+            text = "".join(span.get("text", "") for span in line.get("spans", []))
+            paragraph.add_run(text)
+        
+    
     def _pdf_to_word_basic(self):
         """基本的PDF到Word转换，增强版本，更精确保留原始格式和样式"""
         # 创建Word文档
@@ -1278,6 +1492,1504 @@ class EnhancedPDFConverter:
         finally:
             self.cleanup()
             
+       # Add missing _pdf_to_word_hybrid method
+    def _pdf_to_word_hybrid(self):
+        """
+        混合模式PDF到Word转换，结合文本提取和图像处理
+        
+        此方法平衡格式保留和文件大小：
+        1. 对简单内容使用文本提取
+        2. 对复杂布局使用元素级图像处理
+        3. 智能检测和保留表格（包括合并单元格）
+        """
+        # 创建Word文档
+        doc = Document()
+        
+        try:
+            # 打开PDF文件
+            pdf_document = fitz.open(self.pdf_path)
+            
+            # 获取页面数量
+            page_count = len(pdf_document)
+            
+            # 设置页面大小和边距
+            if page_count > 0:
+                # 获取第一页的尺寸来设置文档属性
+                first_page = pdf_document[0]
+                page_width = first_page.rect.width
+                page_height = first_page.rect.height
+                
+                # 判断页面方向
+                is_landscape = page_width > page_height
+                
+                # 设置页面大小和方向
+                section = doc.sections[0]
+                if is_landscape:
+                    section.orientation = WD_ORIENT.LANDSCAPE
+                    section.page_width = Cm(29.7)
+                    section.page_height = Cm(21)
+                else:
+                    section.orientation = WD_ORIENT.PORTRAIT
+                    section.page_width = Cm(21)
+                    section.page_height = Cm(29.7)
+                
+                # 设置页边距
+                section.left_margin = Cm(1.5)
+                section.right_margin = Cm(1.5)
+                section.top_margin = Cm(1.5)
+                section.bottom_margin = Cm(1.5)
+            
+            # 预先检测表格位置 - 使用增强表格检测算法
+            tables_by_page = {}
+            merged_cells_by_page = {}
+            
+            for page_num in range(page_count):
+                page = pdf_document[page_num]
+                try:
+                    # 优先使用增强表格检测
+                    detected_tables = None
+                    
+                    # 尝试所有可能的表格检测方法
+                    if hasattr(self, 'detect_tables_advanced'):
+                        detected_tables = self.detect_tables_advanced(page)
+                    elif hasattr(page, 'find_tables'):
+                        detected_tables = page.find_tables()
+                    elif hasattr(self, '_extract_tables'):
+                        detected_tables = self._extract_tables(pdf_document, page_num)
+                    
+                    # 处理检测到的表格
+                    if detected_tables:
+                        if hasattr(detected_tables, 'tables'):
+                            tables_by_page[page_num] = detected_tables.tables
+                        else:
+                            tables_by_page[page_num] = detected_tables
+                        
+                        # 检测合并单元格
+                        merged_cells = []
+                        for table in tables_by_page[page_num]:
+                            # 检测合并单元格并添加到列表
+                            try:
+                                if hasattr(self, '_detect_merged_cells'):
+                                    table_merged_cells = self._detect_merged_cells(table)
+                                    if table_merged_cells:
+                                        merged_cells.extend(table_merged_cells)
+                            except Exception as mc_err:
+                                print(f"检测合并单元格时出错: {mc_err}")
+                        
+                        if merged_cells:
+                            merged_cells_by_page[page_num] = merged_cells
+                except Exception as e:
+                    print(f"表格检测警告 (页 {page_num+1}): {e}")
+            
+            # 检测多列布局
+            multi_column_pages = {}
+            if hasattr(self, '_detect_multi_column_pages'):
+                try:
+                    multi_column_pages = self._detect_multi_column_pages(pdf_document)
+                except Exception as e:
+                    print(f"多列检测错误: {e}")
+            
+            # 检测段落样式和标题
+            paragraph_styles_by_page = {}
+            
+            for page_num in range(page_count):
+                page = pdf_document[page_num]
+                try:
+                    # 获取页面文本
+                    page_dict = page.get_text("dict", sort=True)
+                    blocks = page_dict.get("blocks", [])
+                    
+                    # 分析块样式
+                    paragraph_styles = []
+                    
+                    for block in blocks:
+                        if block.get("type") == 0:  # 文本块
+                            # 检测段落格式
+                            if hasattr(self, '_detect_paragraph_format'):
+                                try:
+                                    alignment, left_indent = self._detect_paragraph_format(block, page.rect.width)
+                                    
+                                    # 检测是否是标题
+                                    is_heading = False
+                                    heading_level = 0
+                                    
+                                    # 通过字体大小和样式检测标题
+                                    for line in block.get("lines", []):
+                                        for span in line.get("spans", []):
+                                            font_size = span.get("size", 0)
+                                            font_flags = span.get("flags", 0)
+                                            
+                                            # 大字体或粗体可能是标题
+                                            if font_size > 14:
+                                                is_heading = True
+                                                heading_level = 1
+                                            elif font_size > 12 and (font_flags & 0x1):  # 粗体
+                                                is_heading = True
+                                                heading_level = 2
+                                            elif font_size > 11 and (font_flags & 0x1):  # 小一点的粗体
+                                                is_heading = True
+                                                heading_level = 3
+                                    
+                                    # 收集段落样式信息
+                                    style_info = {
+                                        "bbox": block["bbox"],
+                                        "alignment": alignment,
+                                        "left_indent": left_indent,
+                                        "is_heading": is_heading,
+                                        "heading_level": heading_level
+                                    }
+                                    
+                                    # 提取字体样式
+                                    if block.get("lines") and block["lines"][0].get("spans"):
+                                        span = block["lines"][0]["spans"][0]
+                                        style_info["font"] = {
+                                            "name": span.get("font", ""),
+                                            "size": span.get("size", 11),
+                                            "color": span.get("color", "000000"),
+                                            "flags": span.get("flags", 0)
+                                        }
+                                    
+                                    paragraph_styles.append(style_info)
+                                except Exception as pf_err:
+                                    print(f"检测段落格式时出错pf_err: {pf_err}")
+                    
+                    if paragraph_styles:
+                        paragraph_styles_by_page[page_num] = paragraph_styles
+                        
+                except Exception as style_err:
+                    print(f"段落样式检测警告 (页 {page_num+1}): {style_err}")
+            
+            # 处理每一页
+            for page_num in range(page_count):
+                page = pdf_document[page_num]
+                
+                # 检测页面是否包含复杂内容
+                is_complex = False
+                try:
+                    if hasattr(self, '_is_complex_page'):
+                        is_complex = self._is_complex_page(page)
+                    else:
+                        # 简化版复杂页面检测
+                        images = page.get_images(full=False)
+                        text_dict = page.get_text("dict")
+                        blocks = text_dict.get("blocks", [])
+                        # 判断页面复杂度: 图像数量多或文本块多
+                        is_complex = len(images) > 2 or len(blocks) > 20
+                except Exception as e:
+                    print(f"检测页面复杂度时出错: {e}")
+                    is_complex = False
+                
+                # 检查当前页是否是多列布局
+                is_multi_column = page_num in multi_column_pages
+                
+                # 处理当前页面的内容
+                if is_multi_column:
+                    # 对于多列布局页面，进行分栏处理
+                    try:
+                        columns = multi_column_pages.get(page_num, [])
+                        if hasattr(self, '_process_multi_column_page'):
+                            self._process_multi_column_page(doc, page, pdf_document, tables_by_page.get(page_num, []))
+                        else:
+                            # 简单的多列处理
+                            self._process_page_by_elements(doc, page, pdf_document, tables_by_page.get(page_num, []), is_complex)
+                    except Exception as multi_err:
+                        print(f"处理多列页面时出错: {multi_err}")
+                        # 回退到基本处理
+                        self._process_page_by_elements(doc, page, pdf_document, tables_by_page.get(page_num, []), is_complex)
+                else:
+                    # 对于所有页面，使用元素级处理，不再整页转图像
+                    self._process_page_by_elements(doc, page, pdf_document, tables_by_page.get(page_num, []), is_complex)
+                
+                # 如果不是最后一页，添加分页符
+                if page_num < page_count - 1:
+                    doc.add_page_break()
+
+            # 添加表格样式和合并单元格的后处理
+            self._post_process_document(doc, paragraph_styles_by_page, merged_cells_by_page)
+            
+            # 生成输出文件路径
+            pdf_filename = os.path.basename(self.pdf_path)
+            output_filename = os.path.splitext(pdf_filename)[0] + ".docx"
+            output_path = os.path.join(self.output_dir, output_filename)
+            
+            # 保存Word文档
+            doc.save(output_path)
+            
+            print(f"成功将PDF转换为Word(混合模式): {output_path}")
+            return output_path
+        
+        except Exception as e:
+            print(f"PDF转Word(混合模式)失败: {str(e)}")
+            traceback.print_exc()
+            raise
+        finally:
+            self.cleanup()
+
+    def _post_process_document(self, doc, paragraph_styles_by_page, merged_cells_by_page):
+        """
+        对生成的Word文档进行后处理，应用段落样式和合并单元格
+        
+        参数:
+            doc: Word文档对象
+            paragraph_styles_by_page: 按页面存储的段落样式字典
+            merged_cells_by_page: 按页面存储的合并单元格信息字典
+        """
+        try:
+            # 处理段落样式
+            if paragraph_styles_by_page:
+                # 获取文档中的所有段落
+                all_paragraphs = doc.paragraphs
+                
+                # 获取段落样式的扁平列表
+                all_styles = []
+                for page_num, styles in sorted(paragraph_styles_by_page.items()):
+                    all_styles.extend(styles)
+                
+                # 如果段落数与样式数不匹配，仅应用可以匹配的部分
+                apply_count = min(len(all_paragraphs), len(all_styles))
+                
+                for i in range(apply_count):
+                    para = all_paragraphs[i]
+                    style_info = all_styles[i]
+                    
+                    # 应用对齐方式
+                    if "alignment" in style_info:
+                        para.alignment = style_info["alignment"]
+                    
+                    # 应用左缩进
+                    if "left_indent" in style_info and style_info["left_indent"] > 0:
+                        # 限制缩进到合理范围
+                        left_indent = min(max(style_info["left_indent"], 0), 100)
+                        para.paragraph_format.left_indent = Pt(left_indent * 0.35)  # 点转磅
+                    
+                    # 应用标题样式
+                    if style_info.get("is_heading", False):
+                        heading_level = style_info.get("heading_level", 1)
+                        para.style = f"Heading {heading_level}"
+                    
+                    # 应用字体样式
+                    if "font" in style_info and para.runs:
+                        font_info = style_info["font"]
+                        
+                        for run in para.runs:
+                            # 字体名称
+                            if "name" in font_info and font_info["name"]:
+                                run.font.name = font_info["name"]
+                            
+                            # 字体大小
+                            if "size" in font_info and font_info["size"] > 0:
+                                run.font.size = Pt(font_info["size"])
+                            
+                            # 字体颜色
+                            if "color" in font_info and font_info["color"]:
+                                color = font_info["color"]
+                                if isinstance(color, str) and len(color) == 6:
+                                    try:
+                                        r = int(color[0:2], 16)
+                                        g = int(color[2:4], 16)
+                                        b = int(color[4:6], 16)
+                                        run.font.color.rgb = RGBColor(r, g, b)
+                                    except ValueError:
+                                        pass
+                            
+                            # 字体样式（粗体、斜体等）
+                            if "flags" in font_info:
+                                flags = font_info["flags"]
+                                run.font.bold = bool(flags & 0x1)      # 粗体
+                                run.font.italic = bool(flags & 0x2)    # 斜体
+                                # 下划线（标志位 0x4）
+                                if flags & 0x4:
+                                    run.font.underline = True
+            
+            # 处理表格和合并单元格
+            if merged_cells_by_page:
+                # 获取文档中的所有表格
+                all_tables = doc.tables
+                
+                # 处理每个表格
+                for table_idx, table in enumerate(all_tables):
+                    # 查找此表格对应的合并单元格信息
+                    merged_cells = []
+                    for page_cells in merged_cells_by_page.values():
+                        merged_cells.extend(page_cells)
+                    
+                    # 尝试应用合并单元格
+                    if merged_cells and table_idx < len(merged_cells):
+                        for merge_info in merged_cells:
+                            if len(merge_info) == 4:
+                                start_row, start_col, end_row, end_col = merge_info
+                                
+                                # 验证坐标是否在表格范围内
+                                if (start_row < len(table.rows) and end_row < len(table.rows) and
+                                    start_col < len(table.columns) and end_col < len(table.columns)):
+                                    try:
+                                        # 获取起始和结束单元格
+                                        start_cell = table.cell(start_row, start_col)
+                                        end_cell = table.cell(end_row, end_col)
+                                        
+                                        # 执行合并
+                                        start_cell.merge(end_cell)
+                                        
+                                    except Exception as merge_err:
+                                        print(f"合并单元格时出错: {merge_err}")
+                    
+                    # 确保表格边框可见
+                    try:
+                        table.style = 'Table Grid'
+                        # 如果有自定义边框设置方法，使用它
+                        if hasattr(self, 'set_explicit_borders'):
+                            self.set_explicit_borders(table)
+                    except Exception as border_err:
+                        print(f"设置表格边框时出错: {border_err}")
+                    
+                    # 调整表格宽度以适应页面
+                    try:
+                        # 获取可用宽度
+                        section = doc.sections[0]
+                        available_width = section.page_width.inches - section.left_margin.inches - section.right_margin.inches - 0.1
+                        
+                        # 设置表格宽度
+                        table.width = Inches(available_width)
+                        
+                        # 调整列宽 - 均匀分配
+                        col_width = available_width / len(table.columns)
+                        for col in table.columns:
+                            col.width = Inches(col_width)
+                    except Exception as width_err:
+                        print(f"调整表格宽度时出错: {width_err}")
+        
+        except Exception as e:
+            print(f"文档后处理时出错: {e}")
+            traceback.print_exc()
+
+
+
+
+    def _process_page_by_elements(self, doc, page, pdf_document, tables=None, is_complex=False):
+        """
+        分别处理页面元素，支持表格和图像的精确识别
+        
+        参数:
+            doc: Word文档对象
+            page: PDF页面
+            pdf_document: PDF文档
+            tables: 在页面中检测到的表格列表
+            is_complex: 是否是复杂页面
+        """
+        try:
+            # 获取页面内容
+            page_dict = page.get_text("dict", sort=True)
+            blocks = page_dict["blocks"]
+            
+            # 预处理块，标记表格区域
+            blocks = self._mark_table_regions(blocks, tables)
+            
+            # 按y0坐标排序块，以保持垂直阅读顺序
+            blocks.sort(key=lambda b: (b["bbox"][1], b["bbox"][0]))
+            
+            # 依次处理每个块
+            current_y = -1
+            current_paragraph = None
+            
+            for block in blocks:
+                # 处理表格 - 使用高级表格处理函数
+                if block.get("is_table", False):
+                    self._process_table_with_merged_cells(doc, block, page, pdf_document, tables)
+                    current_paragraph = None
+                    current_y = -1
+                    continue
+                
+                # 处理图像 - 使用高质量图像提取
+                if block["type"] == 1:
+                    self._process_image_block_enhanced(doc, pdf_document, page, block)
+                    current_paragraph = None
+                    current_y = -1
+                    continue
+                
+                # 处理文本
+                if block["type"] == 0:
+                    block_y = block["bbox"][1]
+                    new_paragraph_needed = (current_y == -1 or 
+                                        (abs(block_y - current_y) > 12) or  
+                                        self._is_new_paragraph_by_indent(block, current_paragraph))
+                    
+                    if new_paragraph_needed:
+                        current_paragraph = doc.add_paragraph()
+                        current_y = block_y
+                        
+                        # 设置段落格式
+                        try:
+                            format_result = self._detect_paragraph_format(block, page.rect.width)
+                            if isinstance(format_result, tuple) and len(format_result) == 2:
+                                alignment, left_indent = format_result
+                            else:
+                                alignment = WD_ALIGN_PARAGRAPH.LEFT
+                                left_indent = 0
+                            current_paragraph.alignment = alignment
+                            
+                            # 限制左缩进到安全范围
+                            if left_indent > 0:
+                                left_indent = min(max(left_indent, 0), 100)
+                                current_paragraph.paragraph_format.left_indent = Cm(left_indent / 28.35)
+                        except Exception as e:
+                            print(f"设置段落格式时出错: {e}")
+                            current_paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    
+                    # 处理文本块 - 保留格式
+                    self._process_text_block_with_style(current_paragraph, block)
+            
+            # 处理可能被漏掉的图形和图表
+            self._process_vector_graphics(doc, page)
+            
+        except Exception as e:
+            print(f"处理页面元素时出错: {e}")
+            traceback.print_exc()
+            # 如果处理元素失败，回退到较安全的页面处理方法
+            self._process_complex_page_by_elements(doc, page, pdf_document, tables)
+
+    def _process_table_with_merged_cells(self, doc, block, page, pdf_document, tables):
+        """
+        处理表格，支持合并单元格和保留原始格式
+        
+        参数:
+            doc: Word文档对象
+            block: 表格块
+            page: PDF页面
+            pdf_document: PDF文档
+            tables: 检测到的表格列表
+        """
+        try:
+            # 从block获取表格信息或从tables中查找
+            table_rect = block["bbox"]
+            table_data = None
+            merged_cells = []
+            
+            # 查找此表格在已检测的表格中的匹配项
+            if tables:
+                for table in tables:
+                    if hasattr(table, "bbox"):
+                        tab_rect = table.bbox
+                    elif hasattr(table, "rect"):
+                        tab_rect = table.rect
+                    else:
+                        continue
+                    
+                    # 检查两个矩形是否重叠
+                    if self._rects_overlap(table_rect, tab_rect):
+                        # 找到匹配的表格
+                        table_data = table
+                        # 提取表格数据和合并单元格信息
+                        if hasattr(table, "extract"):
+                            try:
+                                # 尝试提取表格数据
+                                rows_data = table.extract()
+                                
+                                # 检查是否存在单元格合并信息
+                                if hasattr(table, "header_indices"):
+                                    header_rows = table.header_indices
+                                else:
+                                    header_rows = []
+                                    
+                                if hasattr(table, "span_map") or hasattr(table, "spans"):
+                                    span_map = getattr(table, "span_map", getattr(table, "spans", {}))
+                                    for cell_key, span in span_map.items():
+                                        if isinstance(cell_key, tuple) and len(cell_key) == 2:
+                                            row, col = cell_key
+                                            rowspan, colspan = span
+                                            if rowspan > 1 or colspan > 1:
+                                                merged_cells.append((row, col, rowspan, colspan))
+                            except Exception as extract_err:
+                                print(f"表格数据提取失败: {extract_err}")
+                                rows_data = []
+                        break
+            
+            # 如果找不到表格数据，尝试从页面提取
+            if not table_data:
+                # 获取表格区域的图像
+                clip_rect = fitz.Rect(table_rect)
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip_rect)
+                
+                # 保存为临时图像文件
+                img_path = os.path.join(self.temp_dir, f"table_img_{page.number}_{hash(str(table_rect))}.png")
+                pix.save(img_path)
+                
+                # 尝试使用OCR或其他方法分析表格结构
+                if hasattr(self, '_analyze_table_structure'):
+                    try:
+                        rows_data, merged_cells = self._analyze_table_structure(img_path)
+                    except Exception as analyze_err:
+                        print(f"表格结构分析失败: {analyze_err}")
+                        rows_data = []
+                else:
+                    # 如果没有分析方法，尝试基本表格结构检测
+                    try:
+                        if hasattr(self, '_detect_basic_table_structure'):
+                            rows_data, merged_cells = self._detect_basic_table_structure(img_path)
+                        else:
+                            # 兜底方案：从页面文本中提取表格数据
+                            rows_data = self._extract_table_data_from_text(page, table_rect)
+                    except Exception as basic_err:
+                        print(f"基本表格结构检测失败: {basic_err}")
+                        rows_data = []
+            
+            # 创建Word表格
+            if rows_data and len(rows_data) > 0:
+                # 确定行列数
+                num_rows = len(rows_data)
+                num_cols = max([len(row) for row in rows_data]) if rows_data else 0
+                
+                if num_rows > 0 and num_cols > 0:
+                    # 创建表格
+                    table = doc.add_table(rows=num_rows, cols=num_cols)
+                    table.style = 'Table Grid'  # 应用基本网格样式
+                    
+                    # 填充表格数据
+                    for i, row_data in enumerate(rows_data):
+                        for j, cell_data in enumerate(row_data):
+                            if j < num_cols:  # 防止超出列数
+                                # 获取单元格并设置文本
+                                cell = table.cell(i, j)
+                                if cell_data:
+                                    cell.text = str(cell_data)
+                    
+                    # 处理合并单元格
+                    for merge_info in merged_cells:
+                        if len(merge_info) == 4:
+                            row, col, rowspan, colspan = merge_info
+                            if row < num_rows and col < num_cols:
+                                # 确保合并范围不超出表格边界
+                                rowspan = min(rowspan, num_rows - row)
+                                colspan = min(colspan, num_cols - col)
+                                
+                                if rowspan > 1 or colspan > 1:
+                                    # 获取起始单元格
+                                    start_cell = table.cell(row, col)
+                                    
+                                    # 计算合并范围的结束单元格
+                                    end_row = row + rowspan - 1
+                                    end_col = col + colspan - 1
+                                    
+                                    if end_row < num_rows and end_col < num_cols:
+                                        end_cell = table.cell(end_row, end_col)
+                                        
+                                        # 合并单元格
+                                        start_cell.merge(end_cell)
+                    
+                    # 设置表格边框
+                    self._apply_table_borders(table)
+                    
+                    # 优化表格宽度
+                    self._optimize_table_width(table, doc)
+                    
+                    # 设置表格对齐方式
+                    self._set_table_alignment(table, block)
+                else:
+                    # 如果无法提取表格结构，使用图像代替
+                    self._insert_table_as_image(doc, page, table_rect)
+            else:
+                # 如果无法提取表格数据，使用图像代替
+                self._insert_table_as_image(doc, page, table_rect)
+            
+        except Exception as e:
+            print(f"处理表格时出错: {e}")
+            traceback.print_exc()
+            # 如果表格处理失败，回退到图像模式
+            self._insert_table_as_image(doc, page, table_rect)
+
+    def _insert_table_as_image(self, doc, page, table_rect):
+        """
+        将表格区域作为图像插入Word文档
+        
+        参数:
+            doc: Word文档对象
+            page: PDF页面
+            table_rect: 表格区域
+        """
+        try:
+            # 获取表格区域的图像
+            clip_rect = fitz.Rect(table_rect)
+            matrix = fitz.Matrix(2, 2)  # 2x缩放以提高图像质量
+            pix = page.get_pixmap(matrix=matrix, clip=clip_rect)
+            
+            # 保存为临时图像文件
+            img_path = os.path.join(self.temp_dir, f"table_img_{page.number}_{hash(str(table_rect))}.png")
+            pix.save(img_path)
+            
+            # 计算图像宽度
+            table_width = table_rect[2] - table_rect[0]
+            doc_width = doc.sections[0].page_width.inches - doc.sections[0].left_margin.inches - doc.sections[0].right_margin.inches
+            
+            # 计算图像最大宽度（英寸）
+            max_width_inches = min(table_width / 72.0, doc_width - 0.1)
+            
+            # 插入图像
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = p.add_run()
+            run.add_picture(img_path, width=Inches(max_width_inches))
+            
+        except Exception as e:
+            print(f"将表格作为图像插入时出错: {e}")
+
+    def _process_text_block_with_style(self, paragraph, block):
+        """
+        处理文本块，保留字体样式和格式
+        
+        参数:
+            paragraph: Word段落对象
+            block: 文本块
+        """
+        try:
+            # 检查是否有lines
+            if "lines" in block:
+                for line in block["lines"]:
+                    # 处理每个spans
+                    if "spans" in line:
+                        for span in line["spans"]:
+                            # 提取文本内容
+                            text = span.get("text", "")
+                            if not text:
+                                continue
+                                
+                            # 创建文本运行
+                            run = paragraph.add_run(text)
+                            
+                            # 设置字体样式
+                            try:
+                                # 设置字体
+                                font_name = span.get("font", "")
+                                if font_name:
+                                    run.font.name = font_name
+                                
+                                # 设置字体大小
+                                font_size = span.get("size", 0)
+                                if font_size > 0:
+                                    run.font.size = Pt(font_size)
+                                
+                                # 设置粗体
+                                if span.get("bold", False):
+                                    run.font.bold = True
+                                    
+                                # 设置斜体
+                                if span.get("italic", False):
+                                    run.font.italic = True
+                                    
+                                # 设置下划线
+                                if span.get("underline", False):
+                                    run.font.underline = True
+                                    
+                                # 设置颜色
+                                color = span.get("color")
+                                if color and isinstance(color, list) and len(color) >= 3:
+                                    r, g, b = color[0], color[1], color[2]
+                                    run.font.color.rgb = RGBColor(r, g, b)
+                            except Exception as style_err:
+                                print(f"设置字体样式时出错: {style_err}")
+            else:
+                # 如果没有lines结构，直接添加文本
+                text = block.get("text", "")
+                if text:
+                    paragraph.add_run(text)
+        except Exception as e:
+            print(f"处理文本块时出错: {e}")
+            # 直接添加文本，不设置样式
+            try:
+                text = ""
+                if "text" in block:
+                    text = block["text"]
+                elif "lines" in block:
+                    lines_text = []
+                    for line in block["lines"]:
+                        if "spans" in line:
+                            for span in line["spans"]:
+                                if "text" in span:
+                                    lines_text.append(span["text"])
+                    text = " ".join(lines_text)
+                
+                if text:
+                    paragraph.add_run(text)
+            except:
+                pass
+
+    def _apply_table_borders(self, table, border_style="single"):
+        """
+        为表格应用边框样式
+        
+        参数:
+            table: Word表格对象
+            border_style: 边框样式，默认为"single"
+        """
+        try:
+            # 设置表格样式
+            table.style = 'Table Grid'
+            
+            # 设置所有单元格的边框
+            for row in table.rows:
+                for cell in row.cells:
+                    # 在python-docx中，单元格边框通过_element.get_or_add_tcPr()和XML元素设置
+                    # 不能直接访问cell.border属性
+                    
+                    # 获取单元格属性元素
+                    tcPr = cell._element.get_or_add_tcPr()
+                    
+                    # 创建边框元素
+                    tcBorders = OxmlElement('w:tcBorders')
+                    
+                    # 定义边框样式
+                    for border_position in ['top', 'bottom', 'left', 'right']:
+                        border = OxmlElement(f'w:{border_position}')
+                        
+                        # 设置边框类型
+                        if border_style == "single":
+                            border.set(qn('w:val'), 'single')
+                        elif border_style == "double":
+                            border.set(qn('w:val'), 'double')
+                        elif border_style == "dotted":
+                            border.set(qn('w:val'), 'dotted')
+                        elif border_style == "dashed":
+                            border.set(qn('w:val'), 'dashed')
+                        else:
+                            border.set(qn('w:val'), 'single')  # 默认为单线
+                        
+                        # 设置边框宽度
+                        border.set(qn('w:sz'), '4')  # 相当于0.5磅
+                        
+                        # 设置边框颜色
+                        border.set(qn('w:color'), '000000')  # 黑色边框
+                        
+                        # 设置边框间距（可选）
+                        border.set(qn('w:space'), '0')
+                        
+                        # 添加到边框容器
+                        tcBorders.append(border)
+                    
+                    # 将边框添加到单元格属性
+                    tcPr.append(tcBorders)
+        except Exception as e:
+            print(f"应用表格边框时出错: {e}")  
+    def _optimize_table_width(self, table, doc):
+        """
+        优化表格宽度，确保适合页面
+        
+        参数:
+            table: Word表格对象
+            doc: Word文档对象
+        """
+        try:
+            # 获取页面宽度
+            section = doc.sections[0]
+            page_width = section.page_width.inches
+            margins = section.left_margin.inches + section.right_margin.inches
+            available_width = page_width - margins - 0.1  # 保留0.1英寸的边距
+            
+            # 设置表格宽度
+            table.width = Inches(available_width)
+            
+            # 设置列宽平均分布
+            col_count = len(table.columns)
+            if col_count > 0:
+                col_width = available_width / col_count
+                for col in table.columns:
+                    col.width = Inches(col_width)
+        except Exception as e:
+            print(f"优化表格宽度时出错: {e}")
+
+    def _set_table_alignment(self, table, block):
+        """
+        设置表格对齐方式
+        
+        参数:
+            table: Word表格对象
+            block: 表格块
+        """
+        try:
+            # 获取表格位置信息来决定对齐方式
+            bbox = block["bbox"]
+            table_left = bbox[0]
+            table_width = bbox[2] - bbox[0]
+            
+            # 计算相对于页面宽度的位置
+            page_width = block.get("page_width", 0)
+            if page_width == 0 and hasattr(self, 'pdf_width'):
+                page_width = self.pdf_width
+            
+            if page_width > 0:
+                rel_pos = table_left / page_width
+                
+                # 根据相对位置设置对齐方式
+                if rel_pos < 0.2:  # 左对齐
+                    table.alignment = WD_TABLE_ALIGNMENT.LEFT
+                elif rel_pos > 0.4:  # 右对齐
+                    table.alignment = WD_TABLE_ALIGNMENT.RIGHT
+                else:  # 居中对齐
+                    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+            else:
+                # 默认居中对齐
+                table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        except Exception as e:
+            print(f"设置表格对齐方式时出错: {e}")
+            # 默认居中对齐
+            table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+    def _rects_overlap(self, rect1, rect2):
+        """
+        检查两个矩形是否重叠
+        
+        参数:
+            rect1: 第一个矩形 [x0, y0, x1, y1]
+            rect2: 第二个矩形 [x0, y0, x1, y1]
+        
+        返回:
+            bool: 是否重叠
+        """
+        # 转换为fitz.Rect对象，以便使用其内置方法
+        if not isinstance(rect1, fitz.Rect):
+            try:
+                rect1 = fitz.Rect(rect1)
+            except:
+                return False
+        
+        if not isinstance(rect2, fitz.Rect):
+            try:
+                rect2 = fitz.Rect(rect2)
+            except:
+                return False
+        
+        # 使用fitz.Rect的intersects方法
+        return rect1.intersects(rect2)
+
+    def _extract_table_data_from_text(self, page, table_rect):
+        """
+        从页面文本中提取表格数据
+        
+        参数:
+            page: PDF页面
+            table_rect: 表格区域
+        
+        返回:
+            list: 表格数据 [[cell1, cell2, ...], ...]
+        """
+        try:
+            # 获取表格区域的文本
+            clip_rect = fitz.Rect(table_rect)
+            table_text = page.get_text("dict", clip=clip_rect)
+            
+            # 提取文本块
+            if "blocks" in table_text:
+                blocks = table_text["blocks"]
+                blocks.sort(key=lambda b: (b["bbox"][1], b["bbox"][0]))
+                
+                # 按行组织数据
+                rows = []
+                current_row = []
+                current_y = -1
+                
+                for block in blocks:
+                    if block["type"] == 0:  # 文本块
+                        block_y = block["bbox"][1]
+                        
+                        # 如果y坐标差异较大，认为是新的一行
+                        if current_y < 0 or abs(block_y - current_y) > 10:
+                            if current_row:
+                                rows.append(current_row)
+                            current_row = []
+                            current_y = block_y
+                        
+                        # 提取文本
+                        text = ""
+                        if "lines" in block:
+                            for line in block["lines"]:
+                                if "spans" in line:
+                                    for span in line["spans"]:
+                                        if "text" in span:
+                                            text += span["text"] + " "
+                        
+                        # 添加到当前行
+                        current_row.append(text.strip())
+                
+                # 添加最后一行
+                if current_row:
+                    rows.append(current_row)
+                
+                return rows
+            
+            return []
+        except Exception as e:
+            print(f"从文本提取表格数据时出错: {e}")
+            return []
+     
+    def _detect_basic_table_style(self, block, page):
+        """
+        检测表格的基本样式
+        
+        参数:
+            block: 表格块
+            page: PDF页面
+        
+        返回:
+            表格样式信息字典
+        """
+        try:
+            # 获取表格区域
+            bbox = block["bbox"]
+            table_width = bbox[2] - bbox[0]
+            page_width = page.rect.width
+            
+            # 默认样式
+            style_info = {
+                "table_style": "Table Grid",
+                "border_style": "single",
+                "border_width": 1,
+                "border_color": "000000",
+                "cell_padding": 2,
+                "zebra_striping": False,
+                "alternate_row_color": (240, 240, 240)
+            }
+            
+            # 检测表格对齐方式
+            table_left = bbox[0]
+            table_right = bbox[2]
+            rel_left = table_left / page_width
+            rel_right = table_right / page_width
+            
+            if rel_left < 0.1:  # 靠左
+                style_info["alignment"] = "left"
+            elif rel_right > 0.9:  # 靠右
+                style_info["alignment"] = "right"
+            elif abs((rel_left + rel_right) / 2 - 0.5) < 0.1:  # 居中
+                style_info["alignment"] = "center"
+            else:
+                style_info["alignment"] = "left"  # 默认左对齐
+            
+            # 尝试检测列宽
+            col_widths = []
+            try:
+                # 提取表格内容
+                clip_rect = fitz.Rect(bbox)
+                table_text = page.get_text("dict", clip=clip_rect)
+                
+                if "blocks" in table_text and table_text["blocks"]:
+                    # 收集所有文本块的x坐标分布
+                    x_positions = []
+                    for block in table_text["blocks"]:
+                        if block["type"] == 0:  # 文本块
+                            x_positions.append(block["bbox"][0])
+                    
+                    # 如果有足够的数据点，尝试检测列边界
+                    if len(x_positions) > 5:
+                        x_positions.sort()
+                        
+                        # 使用聚类找出列分隔位置
+                        from collections import Counter
+                        # 按接近度分组x坐标（四舍五入到5单位）
+                        x_groups = Counter([round(x / 5) * 5 for x in x_positions])
+                        # 找出频率最高的几个x坐标，可能是列起始位置
+                        common_x = [x for x, count in x_groups.most_common(10) if count > 2]
+                        
+                        if common_x:
+                            # 排序并过滤太接近的位置
+                            common_x.sort()
+                            filtered_x = [common_x[0]]
+                            for x in common_x[1:]:
+                                if x - filtered_x[-1] > 20:  # 至少20单位的间隔
+                                    filtered_x.append(x)
+                            
+                            # 计算列宽
+                            if len(filtered_x) > 1:
+                                filtered_x.append(bbox[2])  # 添加表格右边界
+                                for i in range(len(filtered_x) - 1):
+                                    col_width = filtered_x[i + 1] - filtered_x[i]
+                                    col_widths.append(col_width)
+                
+                # 如果没有足够的数据检测列宽，假设均匀分布
+                if not col_widths or len(col_widths) < 2:
+                    # 估计2-6列
+                    estimated_cols = max(2, min(6, int(table_width / 100)))
+                    col_width = table_width / estimated_cols
+                    col_widths = [col_width] * estimated_cols
+                
+                style_info["col_widths"] = col_widths
+            except Exception as e:
+                print(f"列宽检测失败: {e}")
+                # 默认为均匀宽度的3列
+                col_widths = [table_width / 3] * 3
+                style_info["col_widths"] = col_widths
+            
+            return style_info
+        
+        except Exception as e:
+            print(f"表格样式检测失败: {e}")
+            return {
+                "table_style": "Table Grid",
+                "alignment": "center"
+            }
+
+    def _apply_cell_style(self, cell, style_info):
+        """
+        应用单元格样式
+        
+        参数:
+            cell: Word单元格对象
+            style_info: 样式信息字典
+        """
+        try:
+            # 应用文本对齐方式
+            alignment = style_info.get("alignment")
+            if alignment:
+                for para in cell.paragraphs:
+                    if alignment == "center":
+                        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    elif alignment == "right":
+                        para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                    elif alignment == "justify":
+                        para.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                    else:
+                        para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            
+            # 应用字体样式
+            font_info = style_info.get("font")
+            if font_info and cell.paragraphs and cell.paragraphs[0].runs:
+                run = cell.paragraphs[0].runs[0]
+                
+                # 字体名称
+                if "name" in font_info:
+                    run.font.name = font_info["name"]
+                
+                # 字体大小
+                if "size" in font_info:
+                    run.font.size = Pt(font_info["size"])
+                
+                # 粗体
+                if "bold" in font_info:
+                    run.font.bold = font_info["bold"]
+                
+                # 斜体
+                if "italic" in font_info:
+                    run.font.italic = font_info["italic"]
+                
+                # 颜色
+                if "color" in font_info:
+                    color = font_info["color"]
+                    if isinstance(color, str) and len(color) == 6:
+                        r = int(color[0:2], 16)
+                        g = int(color[2:4], 16)
+                        b = int(color[4:6], 16)
+                        run.font.color.rgb = RGBColor(r, g, b)
+                    elif isinstance(color, (list, tuple)) and len(color) >= 3:
+                        r, g, b = color[0], color[1], color[2]
+                        run.font.color.rgb = RGBColor(r, g, b)
+            
+            # 应用背景色
+            bg_color = style_info.get("background_color")
+            if bg_color:
+                # 将背景色转换为十六进制
+                if isinstance(bg_color, (list, tuple)) and len(bg_color) >= 3:
+                    r, g, b = bg_color[0], bg_color[1], bg_color[2]
+                    bg_color_hex = "%02x%02x%02x" % (r, g, b)
+                elif isinstance(bg_color, str):
+                    bg_color_hex = bg_color.lstrip('#')
+                else:
+                    bg_color_hex = "ffffff"  # 默认白色
+                
+                # 设置单元格阴影
+                shading_elm = cell._element.get_or_add_tcPr()
+                shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{bg_color_hex}"/>')
+                shading_elm.append(shading)
+            
+            # 应用垂直对齐方式
+            vert_align = style_info.get("vertical_alignment")
+            if vert_align:
+                if vert_align == "top":
+                    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
+                elif vert_align == "bottom":
+                    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.BOTTOM
+                else:
+                    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            else:
+                # 默认垂直居中
+                cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+        
+        except Exception as e:
+            print(f"应用单元格样式时出错: {e}")
+
+    def _apply_header_cell_style(self, cell):
+        """
+        应用表头单元格样式
+        
+        参数:
+            cell: Word单元格对象
+        """
+        try:
+            # 设置垂直居中
+            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            
+            # 设置粗体
+            for paragraph in cell.paragraphs:
+                for run in paragraph.runs:
+                    run.font.bold = True
+                
+                # 设置居中对齐
+                paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            
+            # 添加底部边框强调
+            tcPr = cell._element.get_or_add_tcPr()
+            tcBorders = OxmlElement('w:tcBorders')
+            bottomBorder = OxmlElement('w:bottom')
+            bottomBorder.set(qn('w:val'), 'single')
+            bottomBorder.set(qn('w:sz'), '12')  # 2磅线宽
+            bottomBorder.set(qn('w:space'), '0')
+            bottomBorder.set(qn('w:color'), '000000')
+            tcBorders.append(bottomBorder)
+            tcPr.append(tcBorders)
+            
+            # 设置浅灰色背景
+            shading_elm = cell._element.get_or_add_tcPr()
+            shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="F2F2F2"/>')
+            shading_elm.append(shading)
+        
+        except Exception as e:
+            print(f"应用表头样式时出错: {e}")
+
+    def _apply_zebra_striping(self, table, alternate_color):
+        """
+        应用表格斑马纹样式
+        
+        参数:
+            table: Word表格对象
+            alternate_color: 交替行颜色 (r,g,b)
+        """
+        try:
+            # 确保颜色格式正确
+            if isinstance(alternate_color, (list, tuple)) and len(alternate_color) >= 3:
+                r, g, b = alternate_color[0], alternate_color[1], alternate_color[2]
+                color_hex = "%02x%02x%02x" % (r, g, b)
+            elif isinstance(alternate_color, str):
+                color_hex = alternate_color.lstrip('#')
+            else:
+                color_hex = "f2f2f2"  # 默认浅灰色
+            
+            # 为偶数行应用背景色
+            for i, row in enumerate(table.rows):
+                if i % 2 == 1:  # 偶数行 (索引从0开始，所以是i%2==1)
+                    for cell in row.cells:
+                        shading_elm = cell._element.get_or_add_tcPr()
+                        shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{color_hex}"/>')
+                        shading_elm.append(shading)
+        
+        except Exception as e:
+            print(f"应用斑马纹样式时出错: {e}")
+
+    def _apply_html_formatting(self, paragraph, html_text):
+        """
+        应用简单的HTML格式化到段落
+        
+        参数:
+            paragraph: Word段落对象
+            html_text: 包含HTML标记的文本
+        """
+        try:
+            # 简单的HTML解析和格式化
+            current_text = ""
+            is_bold = False
+            is_italic = False
+            is_underline = False
+            
+            i = 0
+            while i < len(html_text):
+                if html_text[i:i+3] == "<b>":
+                    # 如果有积累的文本，先添加现有文本
+                    if current_text:
+                        run = paragraph.add_run(current_text)
+                        run.bold = is_bold
+                        run.italic = is_italic
+                        run.underline = is_underline
+                        current_text = ""
+                    
+                    is_bold = True
+                    i += 3
+                elif html_text[i:i+4] == "</b>":
+                    # 如果有积累的文本，先添加现有文本
+                    if current_text:
+                        run = paragraph.add_run(current_text)
+                        run.bold = is_bold
+                        run.italic = is_italic
+                        run.underline = is_underline
+                        current_text = ""
+                    
+                    is_bold = False
+                    i += 4
+                elif html_text[i:i+3] == "<i>":
+                    # 如果有积累的文本，先添加现有文本
+                    if current_text:
+                        run = paragraph.add_run(current_text)
+                        run.bold = is_bold
+                        run.italic = is_italic
+                        run.underline = is_underline
+                        current_text = ""
+                    
+                    is_italic = True
+                    i += 3
+                elif html_text[i:i+4] == "</i>":
+                    # 如果有积累的文本，先添加现有文本
+                    if current_text:
+                        run = paragraph.add_run(current_text)
+                        run.bold = is_bold
+                        run.italic = is_italic
+                        run.underline = is_underline
+                        current_text = ""
+                    
+                    is_italic = False
+                    i += 4
+                elif html_text[i:i+3] == "<u>":
+                    # 如果有积累的文本，先添加现有文本
+                    if current_text:
+                        run = paragraph.add_run(current_text)
+                        run.bold = is_bold
+                        run.italic = is_italic
+                        run.underline = is_underline
+                        current_text = ""
+                    
+                    is_underline = True
+                    i += 3
+                elif html_text[i:i+4] == "</u>":
+                    # 如果有积累的文本，先添加现有文本
+                    if current_text:
+                        run = paragraph.add_run(current_text)
+                        run.bold = is_bold
+                        run.italic = is_italic
+                        run.underline = is_underline
+                        current_text = ""
+                    
+                    is_underline = False
+                    i += 4
+                elif html_text[i:i+4] == "<br>":
+                    # 如果有积累的文本，先添加现有文本
+                    if current_text:
+                        run = paragraph.add_run(current_text)
+                        run.bold = is_bold
+                        run.italic = is_italic
+                        run.underline = is_underline
+                        run.add_break()
+                        current_text = ""
+                    else:
+                        # 如果没有文本，也添加一个换行
+                        run = paragraph.add_run()
+                        run.add_break()
+                    
+                    i += 4
+                elif html_text[i:i+1] == "<" and ">" in html_text[i:]:
+                    # 跳过其他未处理的HTML标签
+                    end_tag = html_text.find(">", i)
+                    i = end_tag + 1
+                else:
+                    current_text += html_text[i]
+                    i += 1
+            
+            # 添加剩余文本
+            if current_text:
+                run = paragraph.add_run(current_text)
+                run.bold = is_bold
+                run.italic = is_italic
+                run.underline = is_underline
+        
+        except Exception as e:
+            print(f"应用HTML格式化时出错: {e}")
+            # 回退到纯文本
+            paragraph.text = html_text.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", "").replace("<u>", "").replace("</u>", "").replace("<br>", "\n")
+
+    def _process_complex_page_by_elements(self, doc, page, pdf_document, tables):
+        """
+        通过分别处理页面元素来处理复杂页面，而不是整页转换为图片
+        
+        参数:
+            doc: Word文档对象
+            page: PDF页面
+            pdf_document: PDF文档
+            tables: 在页面中检测到的表格列表
+        """
+        try:
+            # 获取页面内容
+            page_dict = page.get_text("dict", sort=True)
+            blocks = page_dict["blocks"]
+            
+            # 预处理块，标记表格区域
+            blocks = self._mark_table_regions(blocks, tables)
+            
+            # 按y0坐标排序块，以保持垂直阅读顺序
+            blocks.sort(key=lambda b: (b["bbox"][1], b["bbox"][0]))
+            
+            # 依次处理每个块
+            current_y = -1
+            current_paragraph = None
+            
+            for block in blocks:
+                # 处理表格
+                if block.get("is_table", False):
+                    self._process_table_block(doc, block, page, pdf_document)
+                    current_paragraph = None
+                    current_y = -1
+                    continue
+                
+                # 处理图像
+                if block["type"] == 1:
+                    self._process_image_block_enhanced(doc, pdf_document, page, block)
+                    current_paragraph = None
+                    current_y = -1
+                    continue
+                
+                # 处理文本
+                if block["type"] == 0:
+                    block_y = block["bbox"][1]
+                    new_paragraph_needed = (current_y == -1 or 
+                                        (abs(block_y - current_y) > 12) or  
+                                        self._is_new_paragraph_by_indent(block, current_paragraph))
+                    
+                    if new_paragraph_needed:
+                        current_paragraph = doc.add_paragraph()
+                        current_y = block_y
+                        
+                        # 设置段落格式
+                        try:
+                            format_result = self._detect_paragraph_format(block, page.rect.width)
+                            if isinstance(format_result, tuple) and len(format_result) == 2:
+                                alignment, left_indent = format_result
+                            else:
+                                alignment = WD_ALIGN_PARAGRAPH.LEFT
+                                left_indent = 0
+                            current_paragraph.alignment = alignment
+                            
+                            # 限制左缩进到安全范围
+                            if left_indent > 0:
+                                left_indent = min(max(left_indent, 0), 100)
+                                current_paragraph.paragraph_format.left_indent = Cm(left_indent / 28.35)
+                        except Exception as e:
+                            print(f"设置段落格式时出错: {e}")
+                            current_paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    
+                    # 处理文本块
+                    self._process_text_block_enhanced(current_paragraph, block)
+                    
+            # 处理可能被漏掉的图形和图表
+            self._process_vector_graphics(doc, page)
+            
+        except Exception as e:
+            print(f"处理复杂页面时出错: {e}")
+            # 如果分析处理失败，回退到整页图像模式
+            print("回退到整页图像模式")
+            self._render_page_as_image(doc, page)
+
+    def _process_vector_graphics(self, doc, page):
+        """处理页面中的矢量图形元素"""
+        try:
+            # 提取页面中的路径对象（可能是图表、图形等）
+            paths = page.get_drawings()
+            if not paths:
+                return
+                    
+            # 如果存在矢量图形，则渲染为图像
+            # 创建一个包含所有路径的合并边界框
+            paths_bbox = None
+            for path in paths:
+                if not path:
+                    continue
+                    
+                # 获取路径的边界框
+                items = path.get("items", [])
+                if not items:
+                    continue
+                    
+                # 计算此路径的边界框
+                path_bbox = None
+                for item in items:
+                    # 避免直接使用 "rect" in item 这种方式，这会导致PyMuPDF内部错误
+                    # 替代方案：安全检查key是否存在，以及类型是否正确
+                    if isinstance(item, dict) and "rect" in item:
+                        rect = item["rect"]
+                        # 确保rect是数值类型，不是字符串
+                        if isinstance(rect, (list, tuple)) and len(rect) == 4:
+                            # 确保所有坐标都是数值
+                            try:
+                                # 创建一个全新的float数组，而不是直接修改原始数据
+                                x0 = float(rect[0])
+                                y0 = float(rect[1])
+                                x1 = float(rect[2])
+                                y1 = float(rect[3])
+                                
+                                # 使用显式坐标创建Rect，而不是从列表转换
+                                rect_obj = fitz.Rect(x0, y0, x1, y1)
+                                
+                                if path_bbox is None:
+                                    path_bbox = rect_obj
+                                else:
+                                    # 使用|=操作符合并矩形
+                                    path_bbox |= rect_obj
+                            except (ValueError, TypeError) as conv_err:
+                                print(f"警告: 矢量图形坐标值转换失败: {rect}, 错误: {conv_err}")
+                                continue
+                
+                if path_bbox:
+                    if paths_bbox is None:
+                        paths_bbox = path_bbox
+                    else:
+                        paths_bbox |= path_bbox
+            
+            # 如果没有有效的边界框，则返回
+            if not paths_bbox:
+                return
+                    
+            # 扩展边界框，确保完整捕获图形
+            # 使用安全的方式访问和修改边界框
+            x0 = max(0, paths_bbox.x0 - 5)
+            y0 = max(0, paths_bbox.y0 - 5)
+            x1 = min(page.rect.width, paths_bbox.x1 + 5)
+            y1 = min(page.rect.height, paths_bbox.y1 + 5)
+            
+            # 创建一个新的边界框对象，避免修改原始对象
+            expanded_bbox = fitz.Rect(x0, y0, x1, y1)
+            
+            # 检查是否为有意义的矢量图形
+            # 忽略太小的或太大的图形
+            width = expanded_bbox.width
+            height = expanded_bbox.height
+            
+            if width < 20 or height < 20 or \
+            width > page.rect.width * 0.9 or \
+            height > page.rect.height * 0.9:
+                return
+                    
+            # 渲染为图像
+            zoom = 4.0  # 高分辨率
+            matrix = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=matrix, clip=expanded_bbox, alpha=False)
+            
+            # 保存为临时文件
+            img_path = os.path.join(self.temp_dir, f"vector_graphics_{page.number}_{hash(str(expanded_bbox))}.png")
+            pix.save(img_path)
+            
+            # 添加到文档
+            if os.path.exists(img_path):
+                # 计算图像宽度
+                graphics_width = width / 72.0  # 转换为英寸
+                
+                # 计算最大宽度
+                try:
+                    section_width = doc.sections[0].page_width.inches
+                    margins = doc.sections[0].left_margin.inches + doc.sections[0].right_margin.inches
+                    max_width_inches = section_width - margins - 0.1
+                except:
+                    max_width_inches = 6.0
+                    
+                # 限制图像宽度
+                img_width = min(graphics_width, max_width_inches)
+                
+                # 添加到文档
+                p = doc.add_paragraph()
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                p.add_run().add_picture(img_path, width=Inches(img_width))
+        except Exception as e:
+            print(f"处理矢量图形时出错: {e}")
+            import traceback
+            traceback.print_exc()
     def _add_table_as_image(self, doc, page, bbox):
         """
         将表格区域作为图像添加到Word文档，确保表格可见
@@ -1477,135 +3189,524 @@ class EnhancedPDFConverter:
                     fixed_table_data[row_idx][col_idx] = clean_value
         
         return fixed_table_data, fixed_merged_cells
-    def _process_table_block(self, doc, block, page, pdf_document):
+    
+    def _detect_table_styles(self, table_block, page):
         """
-        处理表格块并添加到Word文档 - 完整保留表格样式和结构
+        检测表格样式，包括背景色
+
+        参数:
+            table_block: 表格块
+            page: PDF页面
+
+        返回:
+            表格样式信息字典
         """
         try:
-            # 优先使用增强型表格检测
+            # 获取表格区域
+            bbox = table_block["bbox"]
+            table_width = bbox[2] - bbox[0]
+            page_width = page.rect.width
+            
+            # 默认样式
+            style_info = {
+                "table_style": "Table Grid",
+                "border_style": "single",
+                "border_width": 1,
+                "border_color": "000000",
+                "cell_padding": 2,
+                "zebra_striping": False,
+                "alternate_row_color": (240, 240, 240),
+                "cell_styles": []
+            }
+            
+            # 检测表格对齐方式
+            table_left = bbox[0]
+            table_right = bbox[2]
+            rel_left = table_left / page_width
+            rel_right = table_right / page_width
+            
+            if rel_left < 0.1:  # 靠左
+                style_info["alignment"] = "left"
+            elif rel_right > 0.9:  # 靠右
+                style_info["alignment"] = "right"
+            elif abs((rel_left + rel_right) / 2 - 0.5) < 0.1:  # 居中
+                style_info["alignment"] = "center"
+            else:
+                style_info["alignment"] = "left"  # 默认左对齐
+            
+            # 检测单元格背景色和样式
+            # 提取表格区域的详细信息
+            clip_rect = fitz.Rect(bbox)
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip_rect, alpha=False)
+            
+            # 获取表格区域的文本块，用于确定单元格位置
+            table_text = page.get_text("dict", clip=clip_rect)
+            
+            # 提取表格结构
+            table_structure = []
+            if "blocks" in table_text:
+                blocks = sorted(table_text["blocks"], key=lambda b: (b["bbox"][1], b["bbox"][0]))
+                
+                # 按行组织数据
+                rows = []
+                current_row = []
+                current_y = -1
+                row_heights = []
+                
+                for block in blocks:
+                    if block["type"] == 0:  # 文本块
+                        block_y = block["bbox"][1]
+                        
+                        # 如果y坐标差异较大，认为是新的一行
+                        if current_y < 0 or abs(block_y - current_y) > 10:
+                            if current_row:
+                                rows.append(current_row)
+                                row_heights.append(current_y)
+                            current_row = []
+                            current_y = block_y
+                        
+                        # 添加单元格信息
+                        current_row.append({
+                            "bbox": block["bbox"],
+                            "text": self._extract_text_from_block(block)
+                        })
+                
+                # 添加最后一行
+                if current_row:
+                    rows.append(current_row)
+                    row_heights.append(current_y)
+                
+                # 处理单元格样式
+                cell_styles = []
+                has_header = False
+                has_zebra = True
+                
+                for row_idx, row in enumerate(rows):
+                    row_styles = []
+                    
+                    for cell in row:
+                        cell_bbox = cell["bbox"]
+                        # 获取单元格中心点坐标
+                        center_x = (cell_bbox[0] + cell_bbox[2]) / 2
+                        center_y = (cell_bbox[1] + cell_bbox[3]) / 2
+                        
+                        # 检测背景色 - 使用中心点周围区域的平均颜色
+                        bg_color = self._detect_background_color(pixmap, center_x, center_y)
+                        
+                        # 检测是否为表头
+                        is_header = False
+                        text = cell["text"]
+                        
+                        # 检查是否是第一行，可能是表头
+                        if row_idx == 0:
+                            # 通过文本特征识别表头
+                            if text and len(text) < 20:  # 表头通常较短
+                                # 检查字体是否为粗体
+                                if "lines" in block and block["lines"] and "spans" in block["lines"][0]:
+                                    for span in block["lines"][0]["spans"]:
+                                        if span.get("flags", 0) & 0x1:  # 粗体标志
+                                            is_header = True
+                                            break
+                        
+                        # 如果是表头，设置不同的背景色
+                        if is_header:
+                            has_header = True
+                            bg_color = (242, 242, 242)  # 浅灰色表头
+                        
+                        # 检查是否有交替行颜色（斑马纹）
+                        if row_idx > 0 and row_idx % 2 == 1:
+                            # 如果颜色与默认的不同，可能没有斑马纹
+                            if abs(bg_color[0] - 240) > 20 or abs(bg_color[1] - 240) > 20 or abs(bg_color[2] - 240) > 20:
+                                has_zebra = False
+                        
+                        # 创建单元格样式信息
+                        cell_style = {
+                            "background_color": bg_color,
+                            "alignment": "center",  # 默认居中
+                            "vertical_alignment": "center",
+                            "is_header": is_header
+                        }
+                        
+                        row_styles.append(cell_style)
+                    
+                    cell_styles.append(row_styles)
+                
+                # 添加到样式信息
+                style_info["cell_styles"] = cell_styles
+                style_info["has_header"] = has_header
+                style_info["zebra_striping"] = has_zebra
+                
+                # 确定行高和列宽
+                style_info["row_heights"] = row_heights
+                
+                # 确定列宽
+                if rows:
+                    max_cols = max(len(row) for row in rows)
+                    col_x_positions = []
+                    
+                    # 收集所有单元格的x坐标
+                    for row in rows:
+                        for cell in row:
+                            col_x_positions.append(cell["bbox"][0])  # 左边界
+                            col_x_positions.append(cell["bbox"][2])  # 右边界
+                    
+                    # 排序并分组接近的坐标
+                    col_x_positions.sort()
+                    grouped_x = []
+                    last_x = -100
+                    
+                    for x in col_x_positions:
+                        if abs(x - last_x) > 10:  # 如果与上一个坐标差异大于10，认为是新的分隔点
+                            grouped_x.append(x)
+                            last_x = x
+                    
+                    # 计算列宽
+                    col_widths = []
+                    if len(grouped_x) > 1:
+                        for i in range(len(grouped_x) - 1):
+                            col_widths.append(grouped_x[i + 1] - grouped_x[i])
+                    else:
+                        # 默认均分
+                        col_width = table_width / max_cols
+                        col_widths = [col_width] * max_cols
+                    
+                    style_info["col_widths"] = col_widths
+            
+            return style_info
+    
+        except Exception as e:
+            print(f"表格样式检测失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "table_style": "Table Grid",
+                "alignment": "center"
+            }
+
+    def _detect_background_color(self, pixmap, x, y, sample_size=10):
+        """
+        检测pixmap中指定点周围区域的背景颜色
+        
+        参数:
+            pixmap: 页面区域的pixmap
+            x, y: 需要检测颜色的中心点坐标
+            sample_size: 采样区域大小
+        
+        返回:
+            (r, g, b)元组，表示背景色
+        """
+        try:
+            # 转换坐标到pixmap的坐标系统
+            pix_x = int(x * pixmap.w / pixmap.rect.width)
+            pix_y = int(y * pixmap.h / pixmap.rect.height)
+            
+            # 确定采样区域
+            x0 = max(0, pix_x - sample_size // 2)
+            y0 = max(0, pix_y - sample_size // 2)
+            x1 = min(pixmap.w - 1, pix_x + sample_size // 2)
+            y1 = min(pixmap.h - 1, pix_y + sample_size // 2)
+            
+            # 计算区域内的平均颜色
+            r_sum, g_sum, b_sum = 0, 0, 0
+            pixel_count = 0
+            
+            for sy in range(y0, y1 + 1):
+                for sx in range(x0, x1 + 1):
+                    try:
+                        # 获取像素颜色
+                        pixel = pixmap.pixel(sx, sy)
+                        # 解析RGB值
+                        r = (pixel >> 16) & 0xFF
+                        g = (pixel >> 8) & 0xFF
+                        b = pixel & 0xFF
+                        
+                        r_sum += r
+                        g_sum += g
+                        b_sum += b
+                        pixel_count += 1
+                    except:
+                        continue
+            
+            if pixel_count > 0:
+                # 计算平均颜色
+                r_avg = r_sum // pixel_count
+                g_avg = g_sum // pixel_count
+                b_avg = b_sum // pixel_count
+                
+                # 判断是否是白色（或接近白色）
+                if r_avg > 240 and g_avg > 240 and b_avg > 240:
+                    return (255, 255, 255)  # 返回纯白色
+                
+                return (r_avg, g_avg, b_avg)
+            
+            return (255, 255, 255)  # 默认白色
+        
+        except Exception as e:
+            print(f"检测背景颜色时出错: {e}")
+            return (255, 255, 255)  # 默认白色
+
+    def _extract_text_from_block(self, block):
+        """从块中提取文本内容"""
+        text = ""
+        try:
+            if "lines" in block:
+                for line in block["lines"]:
+                    if "spans" in line:
+                        for span in line["spans"]:
+                            if "text" in span:
+                                text += span["text"] + " "
+            return text.strip()
+        except:
+            return ""
+    
+    def _detect_paragraph_format(self, block, page_width):
+        """
+        检测文本块的段落格式（对齐方式和缩进）
+        
+        参数:
+            block: 文本块
+            page_width: 页面宽度
+                
+        返回:
+            tuple: (alignment, left_indent) - 对齐方式和左缩进值
+        """
+        try:
+            # 获取块的边界框
+            bbox = block["bbox"]
+            left = bbox[0]
+            right = bbox[2]
+            width = right - left
+            
+            # 获取块中所有的行
+            lines = block.get("lines", [])
+            if not lines:
+                return WD_ALIGN_PARAGRAPH.LEFT, 0
+            
+            # 收集所有行的左右边界
+            line_lefts = []
+            line_rights = []
+            line_widths = []
+            
+            for line in lines:
+                line_bbox = line["bbox"]
+                line_left = line_bbox[0]
+                line_right = line_bbox[2]
+                line_width = line_right - line_left
+                
+                line_lefts.append(line_left)
+                line_rights.append(line_right)
+                line_widths.append(line_width)
+            
+            # 计算平均值
+            avg_left = sum(line_lefts) / len(line_lefts)
+            avg_right = sum(line_rights) / len(line_rights)
+            avg_width = sum(line_widths) / len(line_widths)
+            
+            # 页面中央位置
+            page_center = page_width / 2
+            
+            # 计算文本块中心点
+            block_center = (avg_left + avg_right) / 2
+            
+            # 检测左缩进
+            left_indent = 0
+            if avg_left > 20:  # 如果左边距大于20点，认为有缩进
+                left_indent = avg_left
+            
+            # 检查是否为居中对齐
+            center_tolerance = page_width * 0.1  # 10%的页面宽度作为容差
+            if abs(block_center - page_center) < center_tolerance:
+                # 额外检查：如果文本宽度很小（相对于页面），更可能是居中的
+                if avg_width < page_width * 0.7:  # 文本宽度小于页面宽度的70%
+                    return WD_ALIGN_PARAGRAPH.CENTER, 0
+            
+            # 检查是否为右对齐
+            right_margin = page_width - avg_right
+            if right_margin < 50 and avg_left > 100:  # 右边距小，左边距大
+                return WD_ALIGN_PARAGRAPH.RIGHT, 0
+            
+            # 检查是否为两端对齐（判断标准：多行文本，且最后一行明显短于其他行）
+            if len(lines) > 1:
+                # 获取除最后一行外的所有行宽度
+                other_line_widths = line_widths[:-1]
+                if other_line_widths:
+                    avg_other_width = sum(other_line_widths) / len(other_line_widths)
+                    last_line_width = line_widths[-1]
+                    
+                    # 如果最后一行明显短于其他行（小于80%），可能是两端对齐
+                    if last_line_width < avg_other_width * 0.8 and avg_width > page_width * 0.7:
+                        return WD_ALIGN_PARAGRAPH.JUSTIFY, left_indent
+            
+            # 检查是否有特殊的段落样式标记
             try:
-                from enhanced_table_detection import extract_table_data
-                table_data, merged_cells = extract_table_data(block, page)
-            except Exception:                
-                table_data = block.get("table_data", [])
+                spans = []
+                for line in lines:
+                    for span in line.get("spans", []):
+                        spans.append(span)
+                
+                # 检查是否包含居中的标题特征（粗体、大字体等）
+                if spans:
+                    first_span = spans[0]
+                    font_size = first_span.get("size", 0)
+                    font_flags = first_span.get("flags", 0)
+                    
+                    # 粗体 (0x1)、大字体 (> 12)、居中位置，很可能是标题
+                    if (font_flags & 0x1) and font_size > 12 and abs(block_center - page_center) < center_tolerance:
+                        return WD_ALIGN_PARAGRAPH.CENTER, 0
+            except Exception as e:
+                print(f"分析段落样式时出错: {e}")
+            
+            # 默认为左对齐，返回检测到的左缩进
+            return WD_ALIGN_PARAGRAPH.LEFT, left_indent
+        except Exception as e:
+            print(f"检测段落格式时出错: {e}")
+            return WD_ALIGN_PARAGRAPH.LEFT, 0
+
+    
+    def _process_table_block(self, doc, block, page, pdf_document):
+        """
+        处理表格块并添加到Word文档
+        
+        参数:
+            doc: Word文档对象
+            block: 表格块
+            page: PDF页面
+            pdf_document: PDF文档
+        """
+        try:
+            # 获取表格数据
+            table_data = []
+            merged_cells = []
+            
+            # 1. 尝试从预检测的数据中获取
+            if "table_data" in block:
+                table_data = block["table_data"]
                 merged_cells = block.get("merged_cells", [])
-            fixed_table_data, fixed_merged_cells = self._validate_and_fix_table_data(table_data, merged_cells)
-            rows = len(fixed_table_data)
-            cols = len(fixed_table_data[0]) if rows > 0 else 0
+            else:
+                # 2. 尝试提取表格数据
+                try:
+                    table_data = self._extract_table_data_from_text(page, block["bbox"])
+                except Exception as extract_err:
+                    print(f"提取表格数据失败: {extract_err}")
+                    
+                if not table_data or len(table_data) == 0:
+                    # 3. 如果提取失败，插入表格图像
+                    self._insert_table_as_image(doc, page, block["bbox"])
+                    return
+            
+            # 检测表格样式，包括背景色
+            table_style_info = self._detect_table_styles(block, page)
+            
+            # 创建Word表格
+            rows = len(table_data)
+            cols = max(len(row) for row in table_data) if table_data else 0
+            
             if rows == 0 or cols == 0:
-                self._add_table_as_image(doc, page, block["bbox"])
+                self._insert_table_as_image(doc, page, block["bbox"])
                 return
-
-            # 检测并应用表格样式
-            try:
-                from enhanced_table_style import detect_table_style, apply_cell_style, apply_table_style
-                table_style_info = detect_table_style(block, page)
-                use_enhanced_style = True
-            except Exception:
-                table_style_info = {}
-                use_enhanced_style = False
-
+            
             # 创建表格
             word_table = doc.add_table(rows=rows, cols=cols)
             word_table.style = table_style_info.get("table_style", "Table Grid")
-
-            # 应用增强边框和内边距
-            try:
-                from improved_table_borders import apply_enhanced_borders
-                border_width = table_style_info.get("border_width", 8)
-                border_color = table_style_info.get("border_color", "000000")
-                if isinstance(border_color, (tuple, list)):
-                    border_color = "%02x%02x%02x" % tuple(border_color[:3])
-                apply_enhanced_borders(word_table, border_width, border_color)
-            except Exception as border_err:
-                print(f"表格边框增强失败: {border_err}")            # 合并单元格
-            for merge_info in fixed_merged_cells:
-                start_row, start_col, end_row, end_col = merge_info                
-                if (0 <= start_row < rows and 0 <= start_col < cols and 0 <= end_row < rows and 0 <= end_col < cols):
-                    try:
-                        cell = word_table.cell(start_row, start_col)
-                        # 先进行垂直合并
-                        if end_row > start_row:
-                            try:
-                                cell.merge(word_table.cell(end_row, start_col))
-                            except Exception as e:
-                                print(f"垂直合并单元格时出错: {e}")
-                        
-                        # 再进行水平合并
-                        if end_col > start_col:
-                            try:
-                                # 如果前面的垂直合并成功，则使用合并后的单元格
-                                # 否则使用原始单元格
-                                merged_cell = word_table.cell(start_row, start_col)
-                                merged_cell.merge(word_table.cell(start_row, end_col))
-                            except Exception as e:
-                                print(f"水平合并单元格时出错: {e}")
-                    except Exception as e:
-                        print(f"处理合并单元格时出错: {e} - 跳过此合并操作")# 填充内容并应用样式
-            for i, row in enumerate(fixed_table_data):
+            
+            # 填充表格数据
+            for i, row in enumerate(table_data):
                 for j, cell_content in enumerate(row):
-                    cell = word_table.cell(i, j)
-                    cell.text = ''
-                    # 多行文本处理
-                    if isinstance(cell_content, str) and '\n' in cell_content:
-                        lines = cell_content.split('\n')
-                        if lines[0]:
-                            first_paragraph = cell.paragraphs[0]
-                            first_paragraph.add_run(lines[0])
-                        for line in lines[1:]:
-                            if line.strip():
-                                new_paragraph = cell.add_paragraph()
-                                new_paragraph.add_run(line)
-                                new_paragraph.space_before = 0
-                                new_paragraph.space_after = 0
-                    else:
-                        if cell_content is not None and str(cell_content).strip():
-                            cell.paragraphs[0].add_run(str(cell_content))
-                    # 应用单元格样式
-                    if use_enhanced_style:
+                    if j < cols:  # 确保不超出列数
+                        cell = word_table.cell(i, j)
+                        if cell_content:
+                            cell.text = str(cell_content)
+                        
+                        # 应用单元格样式
                         try:
-                            apply_cell_style(cell, table_style_info, i, j)
+                            cell_styles = table_style_info.get("cell_styles", [])
+                            if i < len(cell_styles) and j < len(cell_styles[i]):
+                                cell_style = cell_styles[i][j]
+                                
+                                # 应用背景色
+                                bg_color = cell_style.get("background_color")
+                                if bg_color and bg_color != (255, 255, 255):  # 如果不是白色
+                                    r, g, b = bg_color
+                                    color_hex = "%02x%02x%02x" % (r, g, b)
+                                    
+                                    # 设置单元格背景色
+                                    shading_elm = cell._element.get_or_add_tcPr()
+                                    shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{color_hex}"/>')
+                                    shading_elm.append(shading)
+                                
+                                # 应用对齐方式
+                                alignment = cell_style.get("alignment")
+                                if alignment and cell.paragraphs:
+                                    if alignment == "center":
+                                        cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+                                    elif alignment == "right":
+                                        cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                                    else:
+                                        cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.LEFT
+                                
+                                # 应用垂直对齐
+                                vert_align = cell_style.get("vertical_alignment")
+                                if vert_align:
+                                    if vert_align == "top":
+                                        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
+                                    elif vert_align == "bottom":
+                                        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.BOTTOM
+                                    else:
+                                        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+                                
+                                # 应用表头样式
+                                if cell_style.get("is_header", False):
+                                    self._apply_header_cell_style(cell)
                         except Exception as style_err:
-                            print(f"应用单元格样式失败: {style_err}")
-            # 列宽设置
-            if table_style_info.get("col_widths"):
-                for idx, col_width in enumerate(table_style_info["col_widths"]):
-                    if idx < len(word_table.columns):
+                            print(f"应用单元格样式时出错: {style_err}")
+            
+            # 处理合并单元格
+            for merge_info in merged_cells:
+                if len(merge_info) == 4:
+                    start_row, start_col, end_row, end_col = merge_info
+                    
+                    if (start_row < rows and end_row < rows and 
+                        start_col < cols and end_col < cols):
                         try:
-                            if col_width and int(col_width) > 0:
-                                word_table.columns[idx].width = int(col_width)
-                        except Exception:
-                            pass
-            # 斑马纹
-            if table_style_info.get("zebra_striping"):
-                from docx.shared import RGBColor
-                alt_color = table_style_info.get("alternate_row_color", (240,240,240))
-                for i, row in enumerate(word_table.rows):
-                    if i % 2 == 1:
-                        for cell in row.cells:
-                            for para in cell.paragraphs:
-                                para.runs[0].font.highlight_color = None
-                            shading_elm = cell._element.get_or_add_tcPr()
-                            from docx.oxml import parse_xml
-                            from docx.oxml.ns import nsdecls
-                            color_hex = "%02x%02x%02x" % tuple(alt_color[:3])
-                            shading_elm.append(parse_xml(f'<w:shd {nsdecls("w")} w:fill="{color_hex}"/>'))
-            # 垂直居中
-            for row in word_table.rows:
-                for cell in row.cells:
-                    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-            # 表格整体样式
-            if use_enhanced_style:
-                try:
-                    apply_table_style(word_table, table_style_info)
-                except Exception as e:
-                    print(f"应用表格整体样式时出错: {e}")
+                            start_cell = word_table.cell(start_row, start_col)
+                            end_cell = word_table.cell(end_row, end_col)
+                            start_cell.merge(end_cell)
+                        except Exception as merge_err:
+                            print(f"合并单元格时出错: {merge_err}")
+            
+            # 应用表格边框
+            self._apply_table_borders(word_table, table_style_info.get("border_style", "single"))
+            
+            # 优化表格宽度
+            self._optimize_table_width(word_table, doc)
+            
+            # 设置表格对齐方式
+            alignment = table_style_info.get("alignment")
+            if alignment:
+                if alignment == "center":
+                    word_table.alignment = WD_TABLE_ALIGNMENT.CENTER
+                elif alignment == "right":
+                    word_table.alignment = WD_TABLE_ALIGNMENT.RIGHT
+                else:
+                    word_table.alignment = WD_TABLE_ALIGNMENT.LEFT
+            else:
+                self._set_table_alignment(word_table, block)
+            
+            # 应用斑马纹
+            if table_style_info.get("zebra_striping", False):
+                alt_color = table_style_info.get("alternate_row_color", (240, 240, 240))
+                self._apply_zebra_striping(word_table, alt_color)
+            
+            # 添加表格后的间距
             doc.add_paragraph().space_after = Pt(6)
+            
         except Exception as e:
-            print(f"处理表格时出错: {e}，使用图像备用方案")
-            import traceback
+            print(f"处理表格时出错: {e}")
             traceback.print_exc()
-            self._add_table_as_image(doc, page, block["bbox"])
+            # 如果处理失败，使用图像方式
+            self._insert_table_as_image(doc, page, block["bbox"])
+    
+    
     def _process_image_block_enhanced(self, doc, pdf_document, page, block):
         """
         处理图像块，修复版 - 确保图像正确显示
@@ -1993,161 +4094,167 @@ class EnhancedPDFConverter:
 
     def _detect_merged_cells(self, table):
         """
-        检测表格中的合并单元格
+        检测表格中的合并单元格，包括单元格宽度和表头样式
         
         参数:
             table: 表格对象
-            
+                
         返回:
             合并单元格列表，每个元素为 (行开始, 列开始, 行结束, 列结束)
         """
         merged_cells = []
         
         try:
-            # 检查是否是字典对象
-            if isinstance(table, dict):
-                # 如果是字典对象，直接获取merged_cells字段
-                if "merged_cells" in table:
-                    return table.get("merged_cells", [])
-                    
-                # 如果没有merged_cells字段，尝试从cells分析
-                if "cells" not in table or not table["cells"]:
-                    return []
-                    
+            # 检查是否已有合并单元格信息
+            if isinstance(table, dict) and "merged_cells" in table:
+                return table.get("merged_cells", [])
+                
+            # 获取单元格数据
+            cells = None
+            if isinstance(table, dict) and "cells" in table:
                 cells = table["cells"]
-            # 如果是表格对象
             elif hasattr(table, 'cells') and table.cells:
                 cells = table.cells
-            # 如果表格有tables属性 (PyMuPDF 1.18.0+)
-            elif hasattr(table, 'tables') and table.tables:
-                # 尝试获取第一个表格
-                if len(table.tables) > 0:
-                    first_table = table.tables[0]
-                    if hasattr(first_table, 'cells') and first_table.cells:
-                        cells = first_table.cells
-                    else:
-                        return []
-                else:
-                    return []
-            else:
+            elif hasattr(table, 'tables') and table.tables and len(table.tables) > 0:
+                cells = table.tables[0].cells
+            
+            if not cells:
                 return []
                 
-            # 收集边界
-            rows = set()
-            cols = set()
+            # 收集行列边界信息
+            rows_edges = set()
+            cols_edges = set()
             
-            # 处理不同类型的单元格，提取边界信息
             for cell in cells:
+                # 提取单元格边界
                 cell_bbox = None
-                
-                if isinstance(cell, dict) and "bbox" in cell and len(cell["bbox"]) >= 4:
+                if isinstance(cell, dict) and "bbox" in cell:
                     cell_bbox = cell["bbox"]
+                elif hasattr(cell, 'bbox'):
+                    cell_bbox = cell.bbox
                 elif isinstance(cell, (list, tuple)) and len(cell) >= 4:
                     cell_bbox = cell[:4]
-                elif hasattr(cell, 'bbox') and len(cell.bbox) >= 4:
-                    cell_bbox = cell.bbox
                 
-                if not cell_bbox:
+                if not cell_bbox or len(cell_bbox) < 4:
                     continue
                     
-                rows.add(cell_bbox[1])  # Top
-                rows.add(cell_bbox[3])  # Bottom
-                cols.add(cell_bbox[0])  # Left
-                cols.add(cell_bbox[2])  # Right
-                
+                rows_edges.add(cell_bbox[1])  # 顶部
+                rows_edges.add(cell_bbox[3])  # 底部
+                cols_edges.add(cell_bbox[0])  # 左侧
+                cols_edges.add(cell_bbox[2])  # 右侧
+            
             # 排序边界
-            rows = sorted(rows)
-            cols = sorted(cols)
+            rows_edges = sorted(rows_edges)
+            cols_edges = sorted(cols_edges)
             
-            # 映射单元格
+            # 如果边界太少，可能不是有效表格
+            if len(rows_edges) < 2 or len(cols_edges) < 2:
+                return []
+            
+            # 创建行列映射
+            row_mapping = {y: i for i, y in enumerate(rows_edges)}
+            col_mapping = {x: j for j, x in enumerate(cols_edges)}
+            
+            # 识别单元格样式特征，用于检测表头
+            cell_styles = {}
+            has_header = False
+            header_row_indices = []
+            
+            # 计算单元格宽度信息
+            col_widths = [0] * (len(cols_edges) - 1)
+            for i in range(len(cols_edges) - 1):
+                col_widths[i] = cols_edges[i+1] - cols_edges[i]
+            
+            # 检测每个单元格的合并情况
             for cell in cells:
+                # 提取单元格边界
                 cell_bbox = None
+                cell_text = ""
                 
-                if isinstance(cell, dict) and "bbox" in cell and len(cell["bbox"]) >= 4:
-                    cell_bbox = cell["bbox"]
+                if isinstance(cell, dict):
+                    if "bbox" in cell:
+                        cell_bbox = cell["bbox"]
+                    if "text" in cell:
+                        cell_text = cell["text"]
+                    # 检查样式信息
+                    if "font" in cell:
+                        # 记录字体样式信息
+                        cell_styles[tuple(cell_bbox)] = cell["font"]
+                    if "is_header" in cell and cell["is_header"]:
+                        has_header = True
+                elif hasattr(cell, 'bbox'):
+                    cell_bbox = cell.bbox
+                    if hasattr(cell, 'text'):
+                        cell_text = cell.text
+                    # 检查样式属性
+                    if hasattr(cell, 'font'):
+                        cell_styles[tuple(cell_bbox)] = cell.font
+                    if hasattr(cell, 'is_header') and cell.is_header:
+                        has_header = True
                 elif isinstance(cell, (list, tuple)) and len(cell) >= 4:
                     cell_bbox = cell[:4]
-                elif hasattr(cell, 'bbox') and len(cell.bbox) >= 4:
-                    cell_bbox = cell.bbox
+                    if len(cell) > 4 and isinstance(cell[4], str):
+                        cell_text = cell[4]
                 
-                if not cell_bbox:
+                if not cell_bbox or len(cell_bbox) < 4:
                     continue
                 
-                # 获取索引
-                top_idx = rows.index(cell_bbox[1]) if cell_bbox[1] in rows else -1
-                bottom_idx = rows.index(cell_bbox[3]) if cell_bbox[3] in rows else -1
-                left_idx = cols.index(cell_bbox[0]) if cell_bbox[0] in cols else -1
-                right_idx = cols.index(cell_bbox[2]) if cell_bbox[2] in cols else -1
+                # 查找单元格对应的表格位置
+                row_start = row_mapping.get(cell_bbox[1], -1)
+                row_end = row_mapping.get(cell_bbox[3], -1)
+                col_start = col_mapping.get(cell_bbox[0], -1)
+                col_end = col_mapping.get(cell_bbox[2], -1)
                 
-                # 检查合并单元格
-                if top_idx >= 0 and bottom_idx > top_idx and left_idx >= 0 and right_idx > left_idx:
-                    if bottom_idx - top_idx > 1 or right_idx - left_idx > 1:
-                        merged_cells.append((top_idx, left_idx, bottom_idx - 1, right_idx - 1))
+                # 检查是否是合并单元格
+                if (row_start >= 0 and row_end > row_start and 
+                    col_start >= 0 and col_end > col_start):
+                    # 合并单元格跨越多行或多列
+                    if row_end - row_start > 1 or col_end - col_start > 1:
+                        merged_cells.append((row_start, col_start, row_end - 1, col_end - 1))
+                
+                # 检测表头行
+                if row_start == 0 and not has_header:
+                    # 检查是否有表头特征
+                    is_header = False
+                    
+                    # 检查文本是否为粗体或大字体（表头特征）
+                    font_info = cell_styles.get(tuple(cell_bbox), {})
+                    if isinstance(font_info, dict):
+                        if font_info.get("bold", False) or font_info.get("size", 0) > 12:
+                            is_header = True
+                    elif hasattr(font_info, 'bold') and font_info.bold:
+                        is_header = True
+                    elif hasattr(font_info, 'size') and font_info.size > 12:
+                        is_header = True
+                    
+                    # 或者通过文本特征判断是否为表头
+                    if not is_header and cell_text:
+                        # 表头通常较短，且可能包含特定词汇
+                        header_keywords = ["total", "sum", "合计", "小计", "总计", "标题", 
+                                        "序号", "编号", "日期", "时间", "姓名", "名称", 
+                                        "金额", "价格", "数量"]
+                        if (len(cell_text.strip()) < 20 and 
+                            any(keyword in cell_text.lower() for keyword in header_keywords)):
+                            is_header = True
+                    
+                    if is_header and row_start not in header_row_indices:
+                        header_row_indices.append(row_start)
             
-            # 如果上述方法无法检测到合并单元格，尝试备用方法
-            if not merged_cells and hasattr(table, 'extract'):
-                try:
-                    table_data = table.extract()
-                    if not table_data:
-                        return []
-                    
-                    rows = len(table_data)
-                    if rows == 0:
-                        return []
-                    
-                    cols = len(table_data[0]) if rows > 0 else 0
-                    if cols == 0:
-                        return []
-                    
-                    # 跟踪已访问的单元格
-                    visited = [[False for _ in range(cols)] for _ in range(rows)]
-                    
-                    # 检测合并单元格
-                    for i in range(rows):
-                        for j in range(cols):
-                            if visited[i][j]:
-                                continue
-                            
-                            current_value = table_data[i][j]
-                            visited[i][j] = True
-                            
-                            # 检查水平合并
-                            col_span = 1
-                            for c in range(j + 1, cols):
-                                if c < cols and table_data[i][c] == current_value and not visited[i][c]:
-                                    col_span += 1
-                                    visited[i][c] = True
-                                else:
-                                    break
-                            
-                            # 检查垂直合并
-                            row_span = 1
-                            for r in range(i + 1, rows):
-                                if r < rows:
-                                    valid_range = True
-                                    for c in range(j, min(j + col_span, cols)):
-                                        if c >= cols or r >= rows or table_data[r][c] != current_value or visited[r][c]:
-                                            valid_range = False
-                                            break
-                                    
-                                    if valid_range:
-                                        row_span += 1
-                                        for c in range(j, min(j + col_span, cols)):
-                                            visited[r][c] = True
-                                    else:
-                                        break
-                                else:
-                                    break
-                            
-                            # 记录合并单元格
-                            if row_span > 1 or col_span > 1:
-                                merged_cells.append((i, j, i + row_span - 1, j + col_span - 1))
-                except Exception as e:
-                    print(f"备用合并单元格检测失败: {e}")
-        
+            # 如果检测到表头行，添加到表格元数据
+            if header_row_indices and hasattr(table, '_header_rows'):
+                table._header_rows = header_row_indices
+            elif header_row_indices and isinstance(table, dict):
+                table["header_rows"] = header_row_indices
+            
+            # 保存列宽信息
+            if hasattr(table, '_col_widths'):
+                table._col_widths = col_widths
+            elif isinstance(table, dict):
+                table["col_widths"] = col_widths
+            
+            return merged_cells
+            
         except Exception as e:
             print(f"检测合并单元格时出错: {e}")
-            import traceback
             traceback.print_exc()
-        
-        return merged_cells
+            return []

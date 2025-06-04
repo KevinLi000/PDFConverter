@@ -71,6 +71,9 @@ except ImportError as e:
     messagebox.showerror("导入错误", f"无法导入PDF转换器模块: {str(e)}。请确保相关文件在正确的路径下。")
     sys.exit(1)
 
+    """Apply patches to EnhancedPDFConverter"""
+    import types
+    
 class PDFConverterGUI:
     """PDF转换器图形界面"""
     
@@ -835,4 +838,3 @@ if __name__ == "__main__":
         root.mainloop()
     except Exception as e:
         messagebox.showerror("错误", f"程序启动失败: {str(e)}")
-
