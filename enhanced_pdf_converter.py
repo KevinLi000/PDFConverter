@@ -3867,9 +3867,160 @@ class EnhancedPDFConverter:
             return WD_ALIGN_PARAGRAPH.LEFT, 0
 
     
+    def _detect_cell_background_color(self, page, cell_rect, sample_size=5):
+        """
+        检测表格单元格的背景颜色
+        
+        参数:
+            page: PDF页面对象
+            cell_rect: 单元格区域的矩形 (fitz.Rect)
+            sample_size: 采样点大小
+        
+        返回:
+            (r, g, b)元组，表示背景色，如果是白色返回None
+        """
+        try:
+            # 确保cell_rect是fitz.Rect对象
+            if not isinstance(cell_rect, fitz.Rect):
+                cell_rect = fitz.Rect(cell_rect)
+                
+            # 缩小采样区域，避免边框干扰
+            inset = min(cell_rect.width, cell_rect.height) * 0.2  # 缩进20%
+            sample_rect = fitz.Rect(
+                cell_rect.x0 + inset,
+                cell_rect.y0 + inset,
+                cell_rect.x1 - inset,
+                cell_rect.y1 - inset
+            )
+            
+            # 确保采样区域有效
+            if sample_rect.width < 2 or sample_rect.height < 2:
+                sample_rect = cell_rect  # 如果太小，使用原始区域
+            
+            # 获取采样区域的像素数据 - 使用更高的缩放因子提高精度
+            zoom = 2.0  # 增加缩放以提高精度
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=sample_rect, alpha=False)
+            
+            # 收集采样点的颜色
+            colors = []
+            width, height = pix.width, pix.height
+            
+            # 网格采样点 - 中心和四角
+            sample_points = [
+                (width // 2, height // 2),       # 中心
+                (width // 4, height // 4),       # 左上
+                (3 * width // 4, height // 4),   # 右上
+                (width // 4, 3 * height // 4),   # 左下
+                (3 * width // 4, 3 * height // 4) # 右下
+            ]
+            
+            # 收集颜色样本
+            for x, y in sample_points:
+                if 0 <= x < width and 0 <= y < height:
+                    try:
+                        # 获取像素值
+                        pixel_value = pix.pixel(x, y)
+                        
+                        # 处理不同格式的返回值
+                        if isinstance(pixel_value, tuple):
+                            # 如果已经是RGB元组
+                            if len(pixel_value) >= 3:
+                                colors.append(pixel_value[:3])  # 取前三个值(RGB)
+                        elif isinstance(pixel_value, int):
+                            # 如果是整数表示的颜色
+                            r = (pixel_value >> 16) & 0xFF
+                            g = (pixel_value >> 8) & 0xFF
+                            b = pixel_value & 0xFF
+                            colors.append((r, g, b))
+                    except Exception as pixel_err:
+                        print(f"采样颜色时出错({x},{y}): {pixel_err}")
+            
+            # 计算平均颜色 - 只有当收集到颜色样本时
+            if colors:
+                # 排除极端值 - 过滤掉可能的文本颜色
+                filtered_colors = []
+                for color in colors:
+                    # 计算颜色的亮度
+                    brightness = (0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2])
+                    
+                    # 排除过暗的颜色（可能是文本）
+                    if brightness > 30:  # 亮度阈值
+                        filtered_colors.append(color)
+                
+                # 如果过滤后仍有颜色，使用这些颜色
+                if filtered_colors:
+                    colors = filtered_colors
+                
+                # 计算平均颜色
+                r_sum = sum(c[0] for c in colors)
+                g_sum = sum(c[1] for c in colors)
+                b_sum = sum(c[2] for c in colors)
+                
+                r_avg = r_sum // len(colors)
+                g_avg = g_sum // len(colors)
+                b_avg = b_sum // len(colors)
+                
+                # 判断是否是白色或接近白色
+                if r_avg > 240 and g_avg > 240 and b_avg > 240:
+                    return None  # 白色或接近白色返回None
+                
+                # 检查是否是浅灰色 - 如果是，可能不是有意义的背景色
+                if abs(r_avg - g_avg) < 10 and abs(r_avg - b_avg) < 10 and abs(g_avg - b_avg) < 10 and r_avg > 220:
+                    return None  # 浅灰色也返回None
+                    
+                # 返回平均颜色
+                return (r_avg, g_avg, b_avg)
+            
+            return None  # 默认返回None表示无特定背景色
+        
+        except Exception as e:
+            print(f"检测单元格背景色时出错: {e}")
+            traceback.print_exc()
+            return None
 
-
-
+    def _apply_cell_background_color(self, cell, color):
+        """
+        为Word表格单元格应用背景颜色
+        
+        参数:
+            cell: Word表格单元格对象
+            color: (r, g, b)颜色元组
+        """
+        if not color:
+            return
+        
+        try:
+            r, g, b = color
+            
+            # 确保颜色值在有效范围内
+            r = max(0, min(255, int(r)))
+            g = max(0, min(255, int(g)))
+            b = max(0, min(255, int(b)))
+            
+            # 创建RGB颜色字符串（十六进制格式）
+            rgb_str = f"{r:02x}{g:02x}{b:02x}"
+            
+            # 设置单元格背景色
+            shading_elm = cell._element.get_or_add_tcPr()
+            shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{rgb_str}"/>')
+            
+            # 移除现有的底纹元素（如果有）
+            for old_shd in cell._element.tcPr.xpath('./w:shd'):
+                cell._element.tcPr.remove(old_shd)
+            
+            # 添加新的底纹元素
+            cell._element.tcPr.append(shading)
+            
+            # 如果背景色较暗，确保文本为白色以保持可读性
+            brightness = (0.299 * r + 0.587 * g + 0.114 * b)
+            if brightness < 128:  # 背景颜色较暗
+                for paragraph in cell.paragraphs:
+                    for run in paragraph.runs:
+                        run.font.color.rgb = RGBColor(255, 255, 255)
+        
+        except Exception as e:
+            print(f"应用单元格背景色时出错: {e}")
+            traceback.print_exc()
 
 
     
@@ -3926,7 +4077,40 @@ class EnhancedPDFConverter:
                         cell = word_table.cell(i, j)
                         if cell_content:
                             cell.text = str(cell_content)
-                        
+                            # 在填充表格数据的部分中（处理每个单元格的地方）
+                            # 检测并应用单元格背景色
+                            try:
+                                # 获取单元格位置信息
+                                if table_data and i < len(table_data) and j < len(table_data[i]):
+                                    # 如果有可用的单元格位置信息
+                                    cell_bbox = None
+                                    if "cells" in block and f"{i},{j}" in block["cells"]:
+                                        cell_info = block["cells"][f"{i},{j}"]
+                                        if "rect" in cell_info:
+                                            cell_bbox = cell_info["rect"]
+                                    
+                                    # 如果没有直接的单元格信息，使用估算位置
+                                    if not cell_bbox:
+                                        # 估算单元格在表格中的位置
+                                        table_rect = fitz.Rect(block["bbox"])
+                                        cell_width = table_rect.width / cols
+                                        cell_height = table_rect.height / rows
+                                        
+                                        x0 = table_rect.x0 + j * cell_width
+                                        y0 = table_rect.y0 + i * cell_height
+                                        x1 = x0 + cell_width
+                                        y1 = y0 + cell_height
+                                        
+                                        cell_bbox = fitz.Rect(x0, y0, x1, y1)
+                                    
+                                    # 检测背景色
+                                    bg_color = self._detect_cell_background_color(page, cell_bbox)
+                                    if bg_color:
+                                        # 应用背景色
+                                        self._apply_cell_background_color(cell, bg_color)
+                            except Exception as color_err:
+                                print(f"处理单元格背景色时出错: {color_err}")
+                            
                         # 应用单元格样式
                         try:
                             cell_styles = table_style_info.get("cell_styles", [])
