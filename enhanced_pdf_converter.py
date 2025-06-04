@@ -1050,6 +1050,8 @@ class EnhancedPDFConverter:
             print(f"应用高级表格修复时出错: {e}")
             traceback.print_exc()    
     
+
+    
     def _process_text_with_exact_line_breaks(self, paragraph, block):
         """
         处理文本块，精确保留原始换行和段落格式
@@ -1084,7 +1086,12 @@ class EnhancedPDFConverter:
                 left_indent = min(max(left_indent, 0), 100)
                 paragraph.paragraph_format.left_indent = Pt(left_indent * 0.35)
 
-            # 3. 获取行间距信息以检测真正的段落分隔
+            # 3. 分析字体信息 - 找出最常用的字体作为默认字体
+            font_stats = self._analyze_block_fonts(block)
+            default_font = font_stats.get("default_font", "Arial")
+            default_size = font_stats.get("default_size", 11)
+            
+            # 4. 获取行间距信息以检测真正的段落分隔
             lines = block["lines"]
             y_positions = [(i, line["bbox"][1], line["bbox"][3]) for i, line in enumerate(lines)]
             avg_line_height = 0
@@ -1100,9 +1107,16 @@ class EnhancedPDFConverter:
                 if line_gaps:
                     avg_line_height = sum(line_gaps) / len(line_gaps)
             
-            # 4. 智能处理每一行文本
+            # 5. 智能处理每一行文本
             for i, line in enumerate(lines):
                 line_spans = line.get("spans", [])
+                
+                if not line_spans:
+                    # 如果没有spans，添加空行
+                    if i < len(lines) - 1:  # 不是最后一行
+                        if paragraph.runs:
+                            paragraph.runs[-1].add_break()
+                    continue
                 
                 # 添加该行文本，保留格式
                 for span in line_spans:
@@ -1113,37 +1127,8 @@ class EnhancedPDFConverter:
                     # 创建带格式的文本运行
                     run = paragraph.add_run(text)
                     
-                    # 应用字体样式
-                    font_name = span.get("font", "")
-                    if font_name:
-                        run.font.name = font_name
-                    
-                    # 应用字体大小
-                    font_size = span.get("size", 0)
-                    if font_size > 0:
-                        run.font.size = Pt(font_size)
-                    
-                    # 应用字体样式 - 粗体、斜体、下划线
-                    flags = span.get("flags", 0)
-                    if flags:
-                        run.font.bold = bool(flags & 0x1)  # 粗体
-                        run.font.italic = bool(flags & 0x2)  # 斜体
-                        run.font.underline = bool(flags & 0x4)  # 下划线
-                    
-                    # 应用颜色
-                    color = span.get("color", "")
-                    if color:
-                        if isinstance(color, str) and len(color) == 6:
-                            try:
-                                r = int(color[0:2], 16)
-                                g = int(color[2:4], 16)
-                                b = int(color[4:6], 16)
-                                run.font.color.rgb = RGBColor(r, g, b)
-                            except ValueError:
-                                pass
-                        elif isinstance(color, (list, tuple)) and len(color) >= 3:
-                            r, g, b = color[0], color[1], color[2]
-                            run.font.color.rgb = RGBColor(r, g, b)
+                    # 应用字体样式 - 增强版字体映射和处理
+                    self._apply_font_style_to_run(run, span, default_font, default_size)
                 
                 # 判断是否需要添加换行或新段落
                 if i < len(lines) - 1:  # 不是最后一行
@@ -1191,7 +1176,165 @@ class EnhancedPDFConverter:
                         paragraph.add_run(text)
             except:
                 paragraph.add_run("[无法处理文本]")
-    
+
+    def _analyze_block_fonts(self, block):
+        """
+        分析文本块中的字体信息，找出最常用的字体
+        
+        参数:
+            block: 文本块
+            
+        返回:
+            字体统计信息字典
+        """
+        fonts = []
+        sizes = []
+        is_bold = []
+        is_italic = []
+        
+        # 收集所有字体信息
+        if "lines" in block:
+            for line in block["lines"]:
+                if "spans" in line:
+                    for span in line["spans"]:
+                        # 收集字体名称
+                        font_name = span.get("font", "")
+                        if font_name:
+                            # 清理字体名称，移除常见后缀
+                            clean_font = font_name.split('+')[-1]  # 处理'Arial+Italic'这种情况
+                            clean_font = re.sub(r',.*$', '', clean_font)  # 移除逗号后内容
+                            fonts.append(clean_font)
+                        
+                        # 收集字体大小
+                        font_size = span.get("size", 0)
+                        if font_size > 0:
+                            sizes.append(font_size)
+                        
+                        # 收集字体样式
+                        flags = span.get("flags", 0)
+                        if flags:
+                            is_bold.append(bool(flags & 0x1))  # 粗体
+                            is_italic.append(bool(flags & 0x2))  # 斜体
+        
+        # 分析结果
+        result = {
+            "default_font": "Arial",  # 默认字体
+            "default_size": 11,       # 默认大小
+            "is_mostly_bold": False,
+            "is_mostly_italic": False
+        }
+        
+        # 找出最常用的字体
+        if fonts:
+            from collections import Counter
+            font_counter = Counter(fonts)
+            most_common = font_counter.most_common(1)
+            if most_common:
+                result["default_font"] = most_common[0][0]
+        
+        # 计算平均字体大小
+        if sizes:
+            result["default_size"] = sum(sizes) / len(sizes)
+        
+        # 检查是否大多数是粗体或斜体
+        if is_bold:
+            result["is_mostly_bold"] = sum(is_bold) > len(is_bold) / 2
+        
+        if is_italic:
+            result["is_mostly_italic"] = sum(is_italic) > len(is_italic) / 2
+        
+        return result
+
+
+
+    def _apply_font_style_to_run(self, run, span, default_font="Arial", default_size=11):
+        """
+        为文本运行应用字体样式，增强版
+        
+        参数:
+            run: Word文本运行对象
+            span: PDF文本跨度对象
+            default_font: 默认字体名称
+            default_size: 默认字体大小
+        """
+        try:
+            # 1. 应用字体名称
+            font_name = span.get("font", "")
+            if font_name:
+                # 清理和映射字体名称
+                clean_font = font_name.split('+')[-1]  # 处理复合字体名
+                clean_font = re.sub(r',.*$', '', clean_font)  # 移除后缀
+                
+                # 映射字体到Word支持的字体
+                mapped_font = self._map_font(clean_font)
+                run.font.name = mapped_font
+            else:
+                run.font.name = default_font
+            
+            # 2. 应用字体大小
+            font_size = span.get("size", 0)
+            if font_size > 0:
+                # 确保字体大小在合理范围内
+                font_size = min(max(font_size, 5), 72)  # 限制在5-72点之间
+                run.font.size = Pt(font_size)
+            else:
+                run.font.size = Pt(default_size)
+            
+            # 3. 应用字体样式 - 粗体、斜体、下划线
+            flags = span.get("flags", 0)
+            if flags:
+                run.font.bold = bool(flags & 0x1)      # 粗体
+                run.font.italic = bool(flags & 0x2)    # 斜体
+                run.font.underline = bool(flags & 0x4) # 下划线
+            
+            # 4. 应用颜色 - 增强版颜色处理
+            color = span.get("color", "")
+            if color:
+                if isinstance(color, str) and len(color) == 6:
+                    try:
+                        r = int(color[0:2], 16)
+                        g = int(color[2:4], 16)
+                        b = int(color[4:6], 16)
+                        run.font.color.rgb = RGBColor(r, g, b)
+                    except ValueError:
+                        # 如果十六进制转换失败，使用默认黑色
+                        run.font.color.rgb = RGBColor(0, 0, 0)
+                elif isinstance(color, (list, tuple)) and len(color) >= 3:
+                    try:
+                        r = int(color[0])
+                        g = int(color[1])
+                        b = int(color[2])
+                        # 确保RGB值在0-255范围内
+                        r = min(max(r, 0), 255)
+                        g = min(max(g, 0), 255) 
+                        b = min(max(b, 0), 255)
+                        run.font.color.rgb = RGBColor(r, g, b)
+                    except (ValueError, TypeError):
+                        # 如果转换失败，使用默认黑色
+                        run.font.color.rgb = RGBColor(0, 0, 0)
+                
+                # 特殊处理接近黑色的颜色
+                try:
+                    if hasattr(run.font.color, 'rgb') and run.font.color.rgb:
+                        rgb = run.font.color.rgb
+                        if rgb.r < 30 and rgb.g < 30 and rgb.b < 30:
+                            # 近黑色统一处理为纯黑
+                            run.font.color.rgb = RGBColor(0, 0, 0)
+                except AttributeError:
+                    # 如果run.font.color.rgb是None，设置为黑色
+                    run.font.color.rgb = RGBColor(0, 0, 0)
+        
+        except Exception as e:
+            print(f"应用字体样式时出错: {e}")
+            # 应用默认样式以确保可读性
+            try:
+                run.font.name = default_font
+                run.font.size = Pt(default_size)
+                # 确保设置黑色作为默认颜色
+                run.font.color.rgb = RGBColor(0, 0, 0)
+            except:
+                pass
+
     
     def _process_text_block_enhanced(self, paragraph, block):
         """
@@ -1493,6 +1636,8 @@ class EnhancedPDFConverter:
             self.cleanup()
             
        # Add missing _pdf_to_word_hybrid method
+    
+    
     def _pdf_to_word_hybrid(self):
         """
         混合模式PDF到Word转换，结合文本提取和图像处理
@@ -1691,14 +1836,14 @@ class EnhancedPDFConverter:
                             self._process_multi_column_page(doc, page, pdf_document, tables_by_page.get(page_num, []))
                         else:
                             # 简单的多列处理
-                            self._process_page_by_elements(doc, page, pdf_document, tables_by_page.get(page_num, []), is_complex)
+                            self._process_page_with_enhanced_text(doc, page, pdf_document, tables_by_page.get(page_num, []), is_complex)
                     except Exception as multi_err:
                         print(f"处理多列页面时出错: {multi_err}")
                         # 回退到基本处理
-                        self._process_page_by_elements(doc, page, pdf_document, tables_by_page.get(page_num, []), is_complex)
+                        self._process_page_with_enhanced_text(doc, page, pdf_document, tables_by_page.get(page_num, []), is_complex)
                 else:
-                    # 对于所有页面，使用元素级处理，不再整页转图像
-                    self._process_page_by_elements(doc, page, pdf_document, tables_by_page.get(page_num, []), is_complex)
+                    # 对于所有页面，使用带增强文本处理的元素级处理
+                    self._process_page_with_enhanced_text(doc, page, pdf_document, tables_by_page.get(page_num, []), is_complex)
                 
                 # 如果不是最后一页，添加分页符
                 if page_num < page_count - 1:
@@ -1725,6 +1870,162 @@ class EnhancedPDFConverter:
         finally:
             self.cleanup()
 
+    def _process_page_with_enhanced_text(self, doc, page, pdf_document, tables=None, is_complex=False):
+        """
+        使用增强的文本处理功能处理页面元素
+        
+        参数:
+            doc: Word文档对象
+            page: PDF页面
+            pdf_document: PDF文档
+            tables: 在页面中检测到的表格列表
+            is_complex: 是否是复杂页面
+        """
+        try:
+            # 获取页面内容
+            page_dict = page.get_text("dict", sort=True)
+            blocks = page_dict["blocks"]
+            
+            # 预处理块，标记表格区域
+            blocks = self._mark_table_regions(blocks, tables)
+            
+            # 按y0坐标排序块，以保持垂直阅读顺序
+            blocks.sort(key=lambda b: (b["bbox"][1], b["bbox"][0]))
+            
+            # 依次处理每个块
+            current_y = -1
+            current_paragraph = None
+            previous_block_bottom = None
+            last_indent = 0
+            
+            for block in blocks:
+                # 处理表格 - 使用高级表格处理函数
+                if block.get("is_table", False):
+                    self._process_table_block(doc, block, page, pdf_document)
+                    current_paragraph = None
+                    current_y = -1
+                    previous_block_bottom = None
+                    continue
+                
+                # 处理图像 - 使用高质量图像提取
+                if block["type"] == 1:
+                    self._process_image_block_enhanced(doc, pdf_document, page, block)
+                    current_paragraph = None
+                    current_y = -1
+                    previous_block_bottom = None
+                    continue
+                
+                # 处理文本
+                if block["type"] == 0:
+                    block_y = block["bbox"][1]
+                    block_bottom = block["bbox"][3]
+                    
+                    # 检测是否需要新段落
+                    # 1. 通过垂直距离判断
+                    new_paragraph_by_distance = current_y == -1 or abs(block_y - current_y) > 12
+                    
+                    # 2. 通过与上一个块的间距判断
+                    large_gap_from_previous = False
+                    if previous_block_bottom is not None:
+                        gap = block_y - previous_block_bottom
+                        line_height = self._estimate_line_height(block)
+                        large_gap_from_previous = gap > line_height * 1.5
+                    
+                    # 3. 通过缩进判断
+                    indent_change = False
+                    current_indent = block["bbox"][0]
+                    if last_indent > 0:
+                        indent_change = abs(current_indent - last_indent) > 10
+                    last_indent = current_indent
+                    
+                    # 4. 通过其他特征判断
+                    custom_break = self._is_new_paragraph_by_indent(block, current_paragraph)
+                    
+                    # 综合判断是否需要新段落
+                    new_paragraph_needed = (new_paragraph_by_distance or 
+                                        large_gap_from_previous or 
+                                        indent_change or 
+                                        custom_break)
+                    
+                    if new_paragraph_needed:
+                        current_paragraph = doc.add_paragraph()
+                        current_y = block_y
+                        
+                        # 设置段落格式
+                        try:
+                            format_result = self._detect_paragraph_format(block, page.rect.width)
+                            if isinstance(format_result, tuple) and len(format_result) == 2:
+                                alignment, left_indent = format_result
+                            else:
+                                alignment = WD_ALIGN_PARAGRAPH.LEFT
+                                left_indent = 0
+                            current_paragraph.alignment = alignment
+                            
+                            # 限制左缩进到安全范围
+                            if left_indent > 0:
+                                left_indent = min(max(left_indent, 0), 100)
+                                current_paragraph.paragraph_format.left_indent = Pt(left_indent * 0.35)
+                                
+                                # 检测是否是列表项
+                                if block.get("text", "").strip().startswith(("•", "-", "*", "·", "○", "◦", "▪", "■")):
+                                    # 应用项目符号列表样式
+                                    try:
+                                        current_paragraph.style = 'List Bullet'
+                                    except:
+                                        pass
+                                elif re.match(r"^\d+[\.\)]\s", block.get("text", "").strip()):
+                                    # 应用编号列表样式
+                                    try:
+                                        current_paragraph.style = 'List Number'
+                                    except:
+                                        pass
+                                
+                            # 应用段落间距
+                            if large_gap_from_previous and previous_block_bottom is not None:
+                                gap_pt = (block_y - previous_block_bottom) * 0.75  # 转换为磅
+                                current_paragraph.paragraph_format.space_before = Pt(min(gap_pt, 24))  # 限制最大间距
+                                
+                        except Exception as e:
+                            print(f"设置段落格式时出错: {e}")
+                            current_paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    
+                    # 使用精确的换行处理文本块
+                    self._process_text_with_exact_line_breaks(current_paragraph, block)
+                    previous_block_bottom = block_bottom
+                
+                # 处理可能被漏掉的图形和图表
+                self._process_vector_graphics(doc, page)
+                
+        except Exception as e:
+            print(f"处理页面元素时出错: {e}")
+            traceback.print_exc()
+            # 如果处理元素失败，回退到较安全的页面处理方法
+            self._process_page_by_elements(doc, page, pdf_document, tables)
+
+    def _estimate_line_height(self, block):
+        """估计文本块的行高"""
+        try:
+            lines = block.get("lines", [])
+            if not lines:
+                return 12  # 默认行高
+                
+            line_heights = []
+            for line in lines:
+                if "bbox" in line:
+                    line_height = line["bbox"][3] - line["bbox"][1]
+                    line_heights.append(line_height)
+                    
+            if line_heights:
+                return sum(line_heights) / len(line_heights)
+            return 12  # 默认行高
+        except:
+            return 12  # 默认行高
+
+
+
+
+
+    
     def _post_process_document(self, doc, paragraph_styles_by_page, merged_cells_by_page):
         """
         对生成的Word文档进行后处理，应用段落样式和合并单元格
@@ -3383,6 +3684,7 @@ class EnhancedPDFConverter:
                 "alignment": "center"
             }
 
+    
     def _detect_background_color(self, pixmap, x, y, sample_size=10):
         """
         检测pixmap中指定点周围区域的背景颜色
@@ -3397,14 +3699,15 @@ class EnhancedPDFConverter:
         """
         try:
             # 转换坐标到pixmap的坐标系统
-            pix_x = int(x * pixmap.w / pixmap.rect.width)
-            pix_y = int(y * pixmap.h / pixmap.rect.height)
+            # Pixmap对象没有rect属性，但有width和height属性
+            pix_x = int(x * pixmap.width / pixmap.width)  # 简化为直接使用x
+            pix_y = int(y * pixmap.height / pixmap.height)  # 简化为直接使用y
             
             # 确定采样区域
             x0 = max(0, pix_x - sample_size // 2)
             y0 = max(0, pix_y - sample_size // 2)
-            x1 = min(pixmap.w - 1, pix_x + sample_size // 2)
-            y1 = min(pixmap.h - 1, pix_y + sample_size // 2)
+            x1 = min(pixmap.width - 1, pix_x + sample_size // 2)
+            y1 = min(pixmap.height - 1, pix_y + sample_size // 2)
             
             # 计算区域内的平均颜色
             r_sum, g_sum, b_sum = 0, 0, 0
@@ -3444,6 +3747,7 @@ class EnhancedPDFConverter:
         except Exception as e:
             print(f"检测背景颜色时出错: {e}")
             return (255, 255, 255)  # 默认白色
+
 
     def _extract_text_from_block(self, block):
         """从块中提取文本内容"""
@@ -3561,6 +3865,12 @@ class EnhancedPDFConverter:
         except Exception as e:
             print(f"检测段落格式时出错: {e}")
             return WD_ALIGN_PARAGRAPH.LEFT, 0
+
+    
+
+
+
+
 
     
     def _process_table_block(self, doc, block, page, pdf_document):
