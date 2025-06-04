@@ -1,0 +1,6 @@
+# Requirements file specifically for handling the ARC4 deprecation warning
+# Run: pip install -r requirements_fix_arc4.txt
+
+# Ensure cryptography is updated to at least version 47.0.0 (current at time of writing)
+# This ensures it has the decrepit module but is before version 48.0.0 when ARC4 will be removed
+cryptography>=47.0.0,<48.0.0
