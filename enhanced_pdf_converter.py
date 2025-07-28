@@ -361,7 +361,42 @@ class EnhancedPDFConverter:
             return self._pdf_to_word_hybrid()
         else:  # advanced
             return self._pdf_to_word_advanced()
-            
+
+
+    def _extract_header_footer(self, page):
+        """
+        检测并提取当前页的页眉和页脚文本块
+        返回: (header_text, footer_text)
+        """
+        try:
+            blocks = page.get_text("dict", sort=True)["blocks"]
+            page_height = page.rect.height
+            header_text = ""
+            footer_text = ""
+            # 经验阈值：距离页面顶部/底部20pt以内的文本视为页眉/页脚
+            for block in blocks:
+                if block["type"] != 0:
+                    continue
+                y0, y1 = block["bbox"][1], block["bbox"][3]
+                # 页眉
+                if y1 < 40:
+                    header_text += self._block_to_text(block) + " "
+                # 页脚
+                if y0 > page_height - 40:
+                    footer_text += self._block_to_text(block) + " "
+            return header_text.strip(), footer_text.strip()
+        except Exception as e:
+            print(f"页眉页脚提取失败: {e}")
+            return "", ""
+
+    def _block_to_text(self, block):
+        """将文本块内容合成为纯文本"""
+        lines = []
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                lines.append(span.get("text", ""))
+        return " ".join(lines)
+
     def _pdf_to_word_advanced(self):
         """高级PDF到Word转换，使用页面图像渲染，确保最精确的格式保留"""
         # 创建Word文档
@@ -413,7 +448,15 @@ class EnhancedPDFConverter:
             # 处理每一页
             for page_num in range(page_count):
                 page = pdf_document[page_num]
-                
+                       # 新增：提取页眉页脚
+                header_text, footer_text = self._extract_header_footer(page)
+                section = doc.sections[0]
+                if header_text:
+                    section.header.is_linked_to_previous = False
+                    section.header.paragraphs[0].text = header_text
+                if footer_text:
+                    section.footer.is_linked_to_previous = False
+                    section.footer.paragraphs[0].text = footer_text
                 # 渲染页面为图像并添加到文档
                 self._render_page_as_image(doc, page)
                 
@@ -1050,133 +1093,51 @@ class EnhancedPDFConverter:
             print(f"应用高级表格修复时出错: {e}")
             traceback.print_exc()    
     
-
-    
     def _process_text_with_exact_line_breaks(self, paragraph, block):
         """
-        处理文本块，精确保留原始换行和段落格式
-        
-        参数:
-            paragraph: Word段落对象
-            block: PDF文本块
+        处理文本块，精确保留原始换行和段落格式，并应用每个span的样式
         """
         try:
-            # 1. 首先检查是否存在lines
             if "lines" not in block or not block["lines"]:
-                if "text" in block and block["text"]:
-                    # 如果只有文本，直接处理可能的换行
-                    lines = block["text"].split("\n")
-                    if len(lines) > 1:
-                        paragraph.add_run(lines[0])
-                        for line in lines[1:]:
-                            last_run = paragraph.add_run()
-                            last_run.add_break()  # 添加换行符
-                            paragraph.add_run(line)
-                    else:
-                        paragraph.add_run(block["text"])
+                text = block.get("text", "")
+                if text:
+                    paragraph.add_run(text)
                 return
 
-            # 2. 处理样式信息
-            page_width = block.get("page_width", 595)  # 默认A4宽度
+            page_width = block.get("page_width", 595)
             align, left_indent = self._detect_paragraph_format(block, page_width)
             paragraph.alignment = align
-            
-            # 限制左缩进到安全范围
             if left_indent > 0:
                 left_indent = min(max(left_indent, 0), 100)
                 paragraph.paragraph_format.left_indent = Pt(left_indent * 0.35)
 
-            # 3. 分析字体信息 - 找出最常用的字体作为默认字体
             font_stats = self._analyze_block_fonts(block)
             default_font = font_stats.get("default_font", "Arial")
             default_size = font_stats.get("default_size", 11)
-            
-            # 4. 获取行间距信息以检测真正的段落分隔
+
             lines = block["lines"]
-            y_positions = [(i, line["bbox"][1], line["bbox"][3]) for i, line in enumerate(lines)]
-            avg_line_height = 0
-            line_gaps = []
-            
-            if len(lines) > 1:
-                for i in range(len(lines) - 1):
-                    curr_bottom = lines[i]["bbox"][3]
-                    next_top = lines[i+1]["bbox"][1]
-                    gap = next_top - curr_bottom
-                    line_gaps.append(gap)
-                
-                if line_gaps:
-                    avg_line_height = sum(line_gaps) / len(line_gaps)
-            
-            # 5. 智能处理每一行文本
             for i, line in enumerate(lines):
-                line_spans = line.get("spans", [])
-                
-                if not line_spans:
-                    # 如果没有spans，添加空行
-                    if i < len(lines) - 1:  # 不是最后一行
-                        if paragraph.runs:
-                            paragraph.runs[-1].add_break()
+                spans = line.get("spans", [])
+                if not spans:
+                    if i < len(lines) - 1 and paragraph.runs:
+                        paragraph.runs[-1].add_break()
                     continue
-                
-                # 添加该行文本，保留格式
-                for span in line_spans:
+                for span in spans:
                     text = span.get("text", "")
                     if not text:
                         continue
-                    
-                    # 创建带格式的文本运行
                     run = paragraph.add_run(text)
-                    
-                    # 应用字体样式 - 增强版字体映射和处理
                     self._apply_font_style_to_run(run, span, default_font, default_size)
-                
-                # 判断是否需要添加换行或新段落
-                if i < len(lines) - 1:  # 不是最后一行
-                    # 如果两行之间的间距大于平均行高的1.8倍，创建新段落
-                    curr_bottom = line["bbox"][3]
-                    next_top = lines[i+1]["bbox"][1]
-                    line_gap = next_top - curr_bottom
-                    
-                    if avg_line_height > 0 and line_gap > avg_line_height * 1.8:
-                        # 创建新段落
-                        paragraph = paragraph._parent.add_paragraph()
-                        paragraph.alignment = align
-                        if left_indent > 0:
-                            paragraph.paragraph_format.left_indent = Pt(left_indent * 0.35)
-                    else:
-                        # 在同一段落内添加换行符
-                        if paragraph.runs:
-                            paragraph.runs[-1].add_break()
-        
+                # 换行处理
+                if i < len(lines) - 1 and paragraph.runs:
+                    paragraph.runs[-1].add_break()
         except Exception as e:
             print(f"精确换行处理时出错: {e}")
             traceback.print_exc()
-            
-            # 回退到简单文本处理
-            try:
-                text = ""
-                if "text" in block:
-                    text = block["text"]
-                elif "lines" in block:
-                    lines_text = []
-                    for line in block["lines"]:
-                        line_text = "".join(span.get("text", "") for span in line.get("spans", []))
-                        lines_text.append(line_text)
-                    text = "\n".join(filter(None, lines_text))  # 使用换行符连接，过滤空行
-                
-                # 处理文本中的换行
-                if text:
-                    if "\n" in text:
-                        lines = text.split("\n")
-                        paragraph.add_run(lines[0])
-                        for line in lines[1:]:
-                            paragraph.add_run().add_break()
-                            paragraph.add_run(line)
-                    else:
-                        paragraph.add_run(text)
-            except:
-                paragraph.add_run("[无法处理文本]")
-
+            text = block.get("text", "")
+            if text:
+                paragraph.add_run(text)
+    
     def _analyze_block_fonts(self, block):
         """
         分析文本块中的字体信息，找出最常用的字体
@@ -1446,6 +1407,15 @@ class EnhancedPDFConverter:
             tables_by_page = {}
             for page_num in range(len(pdf_document)):
                 page = pdf_document[page_num]
+                       # 新增：提取页眉页脚
+                header_text, footer_text = self._extract_header_footer(page)
+                section = doc.sections[0]
+                if header_text:
+                    section.header.is_linked_to_previous = False
+                    section.header.paragraphs[0].text = header_text
+                if footer_text:
+                    section.footer.is_linked_to_previous = False
+                    section.footer.paragraphs[0].text = footer_text
                 try:
                     # 加载并使用增强的表格检测功能
                     if not hasattr(self, 'detect_tables'):
@@ -2568,27 +2538,40 @@ class EnhancedPDFConverter:
                     tcPr.append(tcBorders)
         except Exception as e:
             print(f"应用表格边框时出错: {e}")  
-    def _optimize_table_width(self, table, doc):
+
+
+    def _optimize_table_width(self, table, doc, col_widths=None):
         """
-        优化表格宽度，确保适合页面
-        
+        优化表格宽度，确保适合页面，并根据实际列宽分配
         参数:
             table: Word表格对象
             doc: Word文档对象
+            col_widths: 列宽列表（单位：PDF坐标点）
         """
         try:
-            # 获取页面宽度
             section = doc.sections[0]
             page_width = section.page_width.inches
             margins = section.left_margin.inches + section.right_margin.inches
             available_width = page_width - margins - 0.1  # 保留0.1英寸的边距
-            
-            # 设置表格宽度
+
             table.width = Inches(available_width)
-            
-            # 设置列宽平均分布
             col_count = len(table.columns)
-            if col_count > 0:
+            if col_count == 0:
+                return
+
+            # 优先使用传入的col_widths
+            if col_widths and len(col_widths) == col_count:
+                total = sum(col_widths)
+                if total > 0:
+                    for i, col in enumerate(table.columns):
+                        col.width = Inches(available_width * (col_widths[i] / total))
+                else:
+                    # fallback to average
+                    col_width = available_width / col_count
+                    for col in table.columns:
+                        col.width = Inches(col_width)
+            else:
+                # fallback to average
                 col_width = available_width / col_count
                 for col in table.columns:
                     col.width = Inches(col_width)
@@ -3397,7 +3380,10 @@ class EnhancedPDFConverter:
                 # 处理非字符串类型
                 if not isinstance(cell_content, str):
                     try:
-                        fixed_row[i] = str(cell_content)
+                        if cell_content is None:
+                            fixed_row[i] = ""
+                        else:
+                            fixed_row[i] = str(cell_content)
                     except:
                         fixed_row[i] = ""
                 
@@ -3479,8 +3465,12 @@ class EnhancedPDFConverter:
         for row_idx, row in enumerate(fixed_table_data):
             for col_idx, cell_value in enumerate(row):
                 if isinstance(cell_value, str):
+                    # 转换None为空字符串
+                    if cell_value is None:
+                        fixed_row[col_idx] = ""
+                        continue
                     # 替换控制字符和其他无效字符
-                    clean_value = ''.join(c if (c.isprintable() or c in ['\n', '\t']) else ' ' for c in cell_value)
+                    clean_value = ''.join(c if (c.isprintable() or c in ['\n', '\t','None']) else ' ' for c in cell_value)
                     
                     # 处理过长的单元格内容
                     if len(clean_value) > 32767:  # Word单元格文本长度限制
@@ -4022,7 +4012,28 @@ class EnhancedPDFConverter:
             print(f"应用单元格背景色时出错: {e}")
             traceback.print_exc()
 
-
+    def _find_adjacent_text_block(self, page, table_block, direction='up'):
+        """
+        查找与表格块相邻的文本块（上方或下方）
+        """
+        try:
+            blocks = page.get_text("dict", sort=True)["blocks"]
+            table_y0, table_y1 = table_block["bbox"][1], table_block["bbox"][3]
+            candidates = []
+            for block in blocks:
+                if block["type"] != 0:
+                    continue
+                y0, y1 = block["bbox"][1], block["bbox"][3]
+                if direction == 'up' and y1 <= table_y0:
+                    candidates.append((y1, block))
+                elif direction == 'down' and y0 >= table_y1:
+                    candidates.append((y0, block))
+            if not candidates:
+                return None
+            # 取最近的一个
+            return sorted(candidates, key=lambda x: abs(x[0] - (table_y0 if direction == 'up' else table_y1)))[0][1]
+        except Exception:
+            return None
     
     def _process_table_block(self, doc, block, page, pdf_document):
         """
@@ -4035,6 +4046,46 @@ class EnhancedPDFConverter:
             pdf_document: PDF文档
         """
         try:
+            # --- 表格前插入段落并应用前一块的样式 ---
+            prev_block = self._find_adjacent_text_block(page, block, direction='up')
+            if prev_block:
+                para_before = doc.add_paragraph()
+                align, left_indent = self._detect_paragraph_format(prev_block, page.rect.width)
+                para_before.alignment = align
+                if left_indent > 0:
+                    para_before.paragraph_format.left_indent = Pt(left_indent * 0.35)
+                # 新增：同步字体、字号、标题样式
+                try:
+                    # 检测是否是标题
+                    is_heading = False
+                    heading_level = 0
+                    for line in prev_block.get("lines", []):
+                        for span in line.get("spans", []):
+                            font_size = span.get("size", 0)
+                            font_flags = span.get("flags", 0)
+                            if font_size > 14:
+                                is_heading = True
+                                heading_level = 1
+                            elif font_size > 12 and (font_flags & 0x1):
+                                is_heading = True
+                                heading_level = 2
+                    if is_heading:
+                        para_before.style = f"Heading {heading_level}"
+                    # 设置字体和字号
+                    if prev_block.get("lines") and prev_block["lines"][0].get("spans"):
+                        span = prev_block["lines"][0]["spans"][0]
+                        # 确保段落有 run
+                        if not para_before.runs:
+                            para_before.add_run()
+                        if "font" in span:
+                            para_before.runs[0].font.name = span["font"]
+                        if "size" in span:
+                            para_before.runs[0].font.size = Pt(span["size"])
+                except Exception as style_err:
+                    print(f"表格前段落样式同步失败: {style_err}")
+
+
+
             # 获取表格数据
             table_data = []
             merged_cells = []
@@ -4167,7 +4218,31 @@ class EnhancedPDFConverter:
                             start_cell.merge(end_cell)
                         except Exception as merge_err:
                             print(f"合并单元格时出错: {merge_err}")
-            
+             # 优化表格宽度（应用PDF实际列宽）
+            col_widths = table_style_info.get("col_widths")
+            if col_widths and len(col_widths) == cols:
+                section = doc.sections[0]
+                page_width = section.page_width.inches
+                margins = section.left_margin.inches + section.right_margin.inches
+                available_width = page_width - margins - 0.1
+                total_pdf_width = sum(col_widths)
+                for j, col in enumerate(word_table.columns):
+                    # 按比例分配Word表格宽度
+                    col.width = Inches(available_width * (col_widths[j] / total_pdf_width))
+
+            # 设置行高（应用PDF实际行高）
+            row_heights = table_style_info.get("row_heights")
+            if row_heights and len(row_heights) == rows:
+                for i, row in enumerate(word_table.rows):
+                    # PDF的高度单位是point，Word用Pt
+                    if i == 0:
+                        height = row_heights[0]
+                    else:
+                        height = row_heights[i] - row_heights[i-1]
+                    # 设置行为“至少”高度，避免内容被截断
+                    row.height = Pt(max(10, height))
+                    row.height_rule = 1  # WD_ROW_HEIGHT_RULE.AT_LEAST
+
             # 应用表格边框
             self._apply_table_borders(word_table, table_style_info.get("border_style", "single"))
             
@@ -4193,7 +4268,42 @@ class EnhancedPDFConverter:
             
             # 添加表格后的间距
             doc.add_paragraph().space_after = Pt(6)
-            
+            # --- 表格后插入段落并应用后一块的样式 ---
+            next_block = self._find_adjacent_text_block(page, block, direction='down')
+            if next_block:
+                para_after = doc.add_paragraph()
+                align, left_indent = self._detect_paragraph_format(next_block, page.rect.width)
+                para_after.alignment = align
+                if left_indent > 0:
+                    para_after.paragraph_format.left_indent = Pt(left_indent * 0.35)
+                # 新增：同步字体、字号、标题样式
+                try:
+                    is_heading = False
+                    heading_level = 0
+                    for line in next_block.get("lines", []):
+                        for span in line.get("spans", []):
+                            font_size = span.get("size", 0)
+                            font_flags = span.get("flags", 0)
+                            if font_size > 14:
+                                is_heading = True
+                                heading_level = 1
+                            elif font_size > 12 and (font_flags & 0x1):
+                                is_heading = True
+                                heading_level = 2
+                    if is_heading:
+                        para_after.style = f"Heading {heading_level}"
+                    if next_block.get("lines") and next_block["lines"][0].get("spans"):
+                        span = next_block["lines"][0]["spans"][0]
+                        if not para_after.runs:
+                            para_after.add_run()
+                        if "font" in span:
+                            para_after.runs[0].font.name = span["font"]
+                        if "size" in span:
+                            para_after.runs[0].font.size = Pt(span["size"])
+                except Exception as style_err:
+                    print(f"表格后段落样式同步失败: {style_err}")
+
+
         except Exception as e:
             print(f"处理表格时出错: {e}")
             traceback.print_exc()

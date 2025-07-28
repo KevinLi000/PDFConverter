@@ -63,10 +63,37 @@ try:
         except ImportError as table_err:
             print(f"警告: 无法导入表格检测和样式修复模块: {table_err}")
             has_table_detection_style_fix = False
+          # 导入表格单元格样式检测修复模块
+        try:
+            from table_cell_style_detection_fix import apply_table_cell_style_detection_fix
+            has_table_cell_style_fix = True
+            print("成功导入表格单元格样式检测修复模块")
+        except ImportError as cell_style_err:
+            print(f"警告: 无法导入表格单元格样式检测修复模块: {cell_style_err}")
+            has_table_cell_style_fix = False        # 导入表格维度修复模块
+        try:
+            from table_dimension_fix import apply_table_dimension_fix
+            has_table_dimension_fix = True
+            print("成功导入表格维度修复模块")
+        except ImportError as dim_fix_err:
+            print(f"警告: 无法导入表格维度修复模块: {dim_fix_err}")
+            has_table_dimension_fix = False
+          # 导入混合模式表格维度修复模块
+        try:
+            from hybrid_mode_table_dimension_fix import apply_hybrid_mode_table_dimension_fix
+            has_hybrid_mode_dimension_fix = True
+            print("成功导入混合模式表格维度修复模块")
+        except ImportError as hybrid_err:
+            print(f"警告: 无法导入混合模式表格维度修复模块: {hybrid_err}")
+            has_hybrid_mode_dimension_fix = False
+            
     except ImportError as format_err:
         print(f"警告: 无法导入增强格式保留模块: {format_err}")
         has_enhanced_format_preservation = False
         has_table_detection_style_fix = False
+        has_table_cell_style_fix = False
+        has_table_dimension_fix = False
+        has_hybrid_mode_dimension_fix = False
 except ImportError as e:
     messagebox.showerror("导入错误", f"无法导入PDF转换器模块: {str(e)}。请确保相关文件在正确的路径下。")
     sys.exit(1)
@@ -444,17 +471,36 @@ class PDFConverterGUI:
                 except Exception as e:
                     self._update_status(f"应用增强格式保留功能失败: {str(e)}, 将使用基本格式保留", 25)
             
-            # 应用精确格式保留增强
-            try:
-                from precise_format_preservation import apply_precise_formatting
-                apply_precise_formatting(converter)
-                self._update_status("已应用精确格式保留增强功能...", 28)
-            except ImportError:
-                self._update_status("找不到精确格式保留模块，跳过...", 28)
-            except Exception as e:
-                self._update_status(f"应用精确格式保留增强功能失败: {str(e)}", 28)
-              # 强制应用增强格式保留设置，确保最佳格式保留
-            self._update_status("应用最大格式保留设置...", 30)
+            # 应用表格检测和样式修复功能 - 表格边框和字体样式
+            if enhance_format and has_table_detection_style_fix:
+                try:
+                    fix_table_detection_and_style(converter)
+                    self._update_status("已应用表格检测和样式修复功能（表格边框和字体样式）...", 26)
+                except Exception as e:
+                    self._update_status(f"应用表格检测和样式修复功能失败: {str(e)}, 将使用基本格式保留", 26)
+              # 应用表格单元格样式检测修复 - 行列尺寸和字体样式
+            if has_table_cell_style_fix:
+                try:
+                    apply_table_cell_style_detection_fix(converter)
+                    self._update_status("已应用表格单元格样式检测修复（行列尺寸和字体样式精确识别）...", 27)
+                except Exception as e:
+                    self._update_status(f"应用表格单元格样式检测修复失败: {str(e)}, 将使用基本样式处理", 27)
+              # 应用表格维度修复 - 解决行宽高识别错误
+            if has_table_dimension_fix:
+                try:
+                    apply_table_dimension_fix(converter)
+                    self._update_status("已应用表格维度修复（解决行宽高识别错误）...", 28)
+                except Exception as e:
+                    self._update_status(f"应用表格维度修复失败: {str(e)}, 将使用默认维度处理", 28)
+            
+            # 应用混合模式表格维度修复 - 专门修复混合模式下的表格维度识别
+            if has_hybrid_mode_dimension_fix:
+                try:
+                    apply_hybrid_mode_table_dimension_fix(converter)
+                    self._update_status("已应用混合模式表格维度修复（修复混合模式表格尺寸错误）...", 29)
+                except Exception as e:
+                    self._update_status(f"应用混合模式表格维度修复失败: {str(e)}, 将使用标准表格处理", 29)            # 强制应用增强格式保留设置，确保最佳格式保留
+            self._update_status("应用最大格式保留设置...", 32)
             
             # 无论是否有enhance_format_preservation方法，都应用高级格式保留设置
             if hasattr(converter, "enhance_format_preservation"):
@@ -464,7 +510,7 @@ class PDFConverterGUI:
             try:
                 from complex_table_enhancement import enhance_complex_table_handling
                 enhance_complex_table_handling(converter)
-                self._update_status("已应用复杂表格格式增强...", 32)
+                self._update_status("已应用复杂表格格式增强...", 33)
             except ImportError:
                 self._update_status("找不到复杂表格增强模块，跳过...", 32)
             except Exception as e:
